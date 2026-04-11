@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : R2 单电机(ID3)伸缩机构测试 - 17圈极限伸缩与抗拒外力保持
+  * @brief          : R2 单电机(ID3)伸缩机构测试 - 3秒平滑插值伸缩与抗拒外力保持
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -116,12 +116,13 @@ int main(void)
 
   /* USER CODE BEGIN 2 */
   // ================= PID 初始化 (仅配置 ID3，数组索引为 2) =================
-  pos_pid[2].Kp = 0.15f; 
-  pos_pid[2].max_output = 3000; // 最快 3000 RPM 伸出
+  // 【优化点】：Kp提升到0.3，max_output放宽到4000，增强抗机械阻力刚性
+  pos_pid[2].Kp = 0.3f; 
+  pos_pid[2].max_output = 4000; 
 
-  spd_pid[2].Kp = 5.0f;  // 速度环比例稍微加大，抗拒外力更强
+  spd_pid[2].Kp = 5.0f;  
   spd_pid[2].Ki = 0.1f; 
-  spd_pid[2].max_output = 8000; // 允许输出大电流抵抗外力
+  spd_pid[2].max_output = 8000; 
 
   CAN_Filter_Init(&hcan1);
   HAL_CAN_Start(&hcan1);
@@ -147,7 +148,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     uint8_t rx_data[8];
     HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
 
-    // 【修改点】：只过滤接收 ID3 (0x203) 的数据
+    // 只过滤接收 ID3 (0x203) 的数据
     if (rx_header.StdId == 0x203) {
         uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
         
@@ -175,15 +176,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6) {
         
-        // --- 核心时序状态机 (加入线性轨迹规划) ---
+        // --- 核心时序状态机 (加入浮点线性轨迹规划) ---
         switch(arm_state) {
-            case 0: // 阶段1：3秒内匀速伸出到最长处
+            case 0: // 阶段1：3秒内平滑匀速伸出
                 state_timer++;
-                // 线性插值：当前目标位置 = (总距离 * 当前时间) / 总时间
-                target_pos = (EXTEND_POS * state_timer) / 3000; 
+                // 使用 float 防止整数运算溢出截断
+                target_pos = (int32_t)(((float)EXTEND_POS * (float)state_timer) / 3000.0f); 
                 
-                if(state_timer >= 3000) { // 3000ms = 3s 走完
-                    target_pos = EXTEND_POS; // 确保最后对齐
+                if(state_timer >= 3000) { 
+                    target_pos = EXTEND_POS; 
                     arm_state = 1; 
                     state_timer = 0; 
                 }
@@ -192,19 +193,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             case 1: // 阶段2：到达最长处，保持静止并抵抗外力 5 秒
                 target_pos = EXTEND_POS; 
                 state_timer++;
-                if(state_timer >= 5000) { // 5000ms = 5s
+                if(state_timer >= 5000) { 
                     arm_state = 2; 
                     state_timer = 0; 
                 }
                 break;
                 
-            case 2: // 阶段3：3秒内匀速缩回到最短处
+            case 2: // 阶段3：3秒内平滑匀速缩回
                 state_timer++;
-                // 线性插值：当前目标位置 = 总距离 - (总距离 * 当前时间) / 总时间
-                target_pos = EXTEND_POS - (EXTEND_POS * state_timer) / 3000;
+                // 回程同样使用 float 平滑计算
+                target_pos = EXTEND_POS - (int32_t)(((float)EXTEND_POS * (float)state_timer) / 3000.0f);
                 
                 if(state_timer >= 3000) { 
-                    target_pos = 0; // 确保最后归零
+                    target_pos = 0; 
                     arm_state = 3; 
                     state_timer = 0; 
                 }
