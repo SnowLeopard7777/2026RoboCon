@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : R2 自动化机械臂测试：旋转 + 伸缩 + 舵机 (完整无错版)
+  * @brief          : R2 单电机(ID3)伸缩机构测试 - 17圈极限伸缩与抗拒外力保持
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -35,10 +35,9 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// 旋转：(90/360) * 1.5 * 19 * 8192
-#define POS_ROTATE_90  (58368)
-// 伸缩：(20cm / (2*PI*2cm)) * 19 * 8192 
-#define POS_EXTEND_20  (247713)
+// 电机尾部（转子）转17圈对应的绝对 Ticks 数
+// 【注意】如果伸出方向是反的，请改成 -(17 * 8192)
+#define EXTEND_POS  (17 * 8192) 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,21 +47,21 @@ typedef struct {
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
-TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim6;
-UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-Motor_Measure_t motor[4]; // 数组索引：1对应ID2(旋转)，2对应ID3(伸缩)
+Motor_Measure_t motor[4]; // 数组索引：2对应ID3
 PID_t pos_pid[4], spd_pid[4];
-int32_t target_pos[4] = {0};
-float target_speed[4] = {0};
-int16_t send_current[4] = {0};
 
-uint8_t is_init[4] = {0};
-int32_t offset_ecd[4] = {0};
-uint8_t arm_state = 0;       
-uint32_t state_timer = 0;
+int32_t target_pos = 0;      // 目标位置
+float target_speed = 0;      // 目标速度
+int16_t send_current = 0;    // 发送电流
+
+uint8_t is_init = 0;
+int32_t offset_ecd = 0;
+
+uint8_t arm_state = 0;       // 状态机阶段
+uint32_t state_timer = 0;    // 计时器 (单位:ms)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,8 +69,6 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_TIM6_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_TIM1_Init(void);
 
 /* USER CODE BEGIN PFP */
 float PID_Calc(PID_t *pid, float target, float measure);
@@ -108,10 +105,6 @@ void CAN_Filter_Init(CAN_HandleTypeDef *hcan) {
 }
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
   HAL_Init();
@@ -120,32 +113,26 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_TIM6_Init();
-  MX_USART1_UART_Init();
-  MX_TIM1_Init();
 
   /* USER CODE BEGIN 2 */
-  // PID 初始化
-  for(int i=1; i<=2; i++) { // 为 ID2 和 ID3 赋予参数
-    pos_pid[i].Kp = 0.15f; pos_pid[i].max_output = 3000;
-    spd_pid[i].Kp = 4.0f;  spd_pid[i].Ki = 0.1f; spd_pid[i].max_output = 8000;
-  }
+  // ================= PID 初始化 (仅配置 ID3，数组索引为 2) =================
+  pos_pid[2].Kp = 0.15f; 
+  pos_pid[2].max_output = 3000; // 最快 3000 RPM 伸出
+
+  spd_pid[2].Kp = 5.0f;  // 速度环比例稍微加大，抗拒外力更强
+  spd_pid[2].Ki = 0.1f; 
+  spd_pid[2].max_output = 8000; // 允许输出大电流抵抗外力
 
   CAN_Filter_Init(&hcan1);
   HAL_CAN_Start(&hcan1);
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+  
+  // 启动控制心跳
   HAL_TIM_Base_Start_IT(&htim6);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); // 开启舵机 PWM
-
-  // 初始舵机位置：中位 (1.5ms)
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 1500);
   /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
     HAL_Delay(10);
   }
@@ -153,32 +140,33 @@ int main(void)
 }
 
 /* USER CODE BEGIN 4 */
-// ================= CAN 接收：带上电归零的多圈解算 =================
+// ================= CAN 接收：上电归零与多圈解算 =================
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     CAN_RxHeaderTypeDef rx_header;
     uint8_t rx_data[8];
     HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
 
-    if (rx_header.StdId >= 0x202 && rx_header.StdId <= 0x203) {
-        uint8_t i = rx_header.StdId - 0x201; // ID2->1, ID3->2
+    // 【修改点】：只过滤接收 ID3 (0x203) 的数据
+    if (rx_header.StdId == 0x203) {
         uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
         
-        if (!is_init[i]) {
-            offset_ecd[i] = current_ecd;
-            is_init[i] = 1;
+        // 上电第一次记录初始位置
+        if (!is_init) {
+            offset_ecd = current_ecd;
+            is_init = 1;
             return;
         }
 
-        motor[i].last_ecd = motor[i].ecd;
-        motor[i].ecd = current_ecd;
-        motor[i].speed_rpm = (rx_data[2] << 8) | rx_data[3];
+        motor[2].last_ecd = motor[2].ecd;
+        motor[2].ecd = current_ecd;
+        motor[2].speed_rpm = (rx_data[2] << 8) | rx_data[3];
         
-        int16_t diff = motor[i].ecd - motor[i].last_ecd;
-        if (diff < -4096) motor[i].total_round++;
-        else if (diff > 4096) motor[i].total_round--;
+        int16_t diff = motor[2].ecd - motor[2].last_ecd;
+        if (diff < -4096) motor[2].total_round++;
+        else if (diff > 4096) motor[2].total_round--;
         
-        motor[i].total_ecd = motor[i].total_round * 8192 + motor[i].ecd - offset_ecd[i];
+        motor[2].total_ecd = motor[2].total_round * 8192 + motor[2].ecd - offset_ecd;
     }
 }
 
@@ -186,59 +174,64 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6) {
-        // 运动完成判定 (容差1000 tick)
-        uint8_t rotate_done = abs(motor[1].total_ecd - target_pos[1]) < 1000;
-        uint8_t extend_done = abs(motor[2].total_ecd - target_pos[2]) < 1000;
-
+        
+        // --- 核心时序状态机 (加入线性轨迹规划) ---
         switch(arm_state) {
-            case 0: // 阶段1：旋转 90 度 (逆时针)
-                target_pos[1] = -POS_ROTATE_90;
-                target_pos[2] = 0;
-                if(rotate_done) { arm_state = 1; state_timer = 0; }
-                break;
+            case 0: // 阶段1：3秒内匀速伸出到最长处
+                state_timer++;
+                // 线性插值：当前目标位置 = (总距离 * 当前时间) / 总时间
+                target_pos = (EXTEND_POS * state_timer) / 3000; 
                 
-            case 1: // 阶段2：伸出 20cm (逆时针)
-                target_pos[1] = -POS_ROTATE_90;
-                target_pos[2] = -POS_EXTEND_20;
-                if(extend_done) { 
-                    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, 1500); // 舵机中位
-                    arm_state = 2; state_timer = 0; 
+                if(state_timer >= 3000) { // 3000ms = 3s 走完
+                    target_pos = EXTEND_POS; // 确保最后对齐
+                    arm_state = 1; 
+                    state_timer = 0; 
                 }
                 break;
                 
-            case 2: // 阶段3：静止 4s
+            case 1: // 阶段2：到达最长处，保持静止并抵抗外力 5 秒
+                target_pos = EXTEND_POS; 
                 state_timer++;
-                if(state_timer >= 4000) { arm_state = 3; state_timer = 0; }
+                if(state_timer >= 5000) { // 5000ms = 5s
+                    arm_state = 2; 
+                    state_timer = 0; 
+                }
                 break;
                 
-            case 3: // 阶段4：原路返回 - 缩回
-                target_pos[1] = -POS_ROTATE_90;
-                target_pos[2] = 0;
-                if(extend_done) { arm_state = 4; state_timer = 0; }
+            case 2: // 阶段3：3秒内匀速缩回到最短处
+                state_timer++;
+                // 线性插值：当前目标位置 = 总距离 - (总距离 * 当前时间) / 总时间
+                target_pos = EXTEND_POS - (EXTEND_POS * state_timer) / 3000;
+                
+                if(state_timer >= 3000) { 
+                    target_pos = 0; // 确保最后归零
+                    arm_state = 3; 
+                    state_timer = 0; 
+                }
                 break;
                 
-            case 4: // 阶段5：原路返回 - 旋转复位
-                target_pos[1] = 0;
-                target_pos[2] = 0;
-                if(rotate_done) { arm_state = 0; state_timer = 0; } // 循环
+            case 3: // 阶段4：在最短处停顿 2 秒后循环
+                target_pos = 0;
+                state_timer++;
+                if(state_timer >= 2000) { 
+                    arm_state = 0; 
+                    state_timer = 0; 
+                }
                 break;
         }
 
-        // PID 计算与 CAN 发送
-        for(int i = 1; i <= 2; i++) {
-            target_speed[i] = PID_Calc(&pos_pid[i], (float)target_pos[i], (float)motor[i].total_ecd);
-            send_current[i] = (int16_t)PID_Calc(&spd_pid[i], target_speed[i], (float)motor[i].speed_rpm);
-        }
+        // --- 串级 PID 计算 (使用索引 2) ---
+        target_speed = PID_Calc(&pos_pid[2], (float)target_pos, (float)motor[2].total_ecd);
+        send_current = (int16_t)PID_Calc(&spd_pid[2], target_speed, (float)motor[2].speed_rpm);
 
+        // --- CAN 打包与发送 ---
         CAN_TxHeaderTypeDef tx_header = {0x200, 0, CAN_ID_STD, CAN_RTR_DATA, 8};
         uint8_t tx_data[8] = {0};
         uint32_t tx_mailbox;
         
-        // 封包：ID2对应data[2][3], ID3对应data[4][5]
-        tx_data[2] = send_current[1] >> 8; 
-        tx_data[3] = send_current[1] & 0xFF;
-        tx_data[4] = send_current[2] >> 8; 
-        tx_data[5] = send_current[2] & 0xFF;
+        // 封包 ID3，对应 data[4] 和 data[5]
+        tx_data[4] = send_current >> 8; 
+        tx_data[5] = send_current & 0xFF;
         
         HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
     }
@@ -293,41 +286,6 @@ static void MX_CAN1_Init(void)
   if (HAL_CAN_Init(&hcan1) != HAL_OK) { Error_Handler(); }
 }
 
-static void MX_TIM1_Init(void)
-{
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 167;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 19999;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) { Error_Handler(); }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) { Error_Handler(); }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) { Error_Handler(); }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) { Error_Handler(); }
-  HAL_TIM_MspPostInit(&htim1);
-}
-
 static void MX_TIM6_Init(void)
 {
   TIM_MasterConfigTypeDef sMasterConfig = {0};
@@ -343,19 +301,6 @@ static void MX_TIM6_Init(void)
   if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
-static void MX_USART1_UART_Init(void)
-{
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
-}
-
 static void MX_GPIO_Init(void)
 {
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -369,7 +314,3 @@ void Error_Handler(void)
   __disable_irq();
   while (1) { }
 }
-
-#ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line) { }
-#endif /* USE_FULL_ASSERT */
