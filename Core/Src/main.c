@@ -2,10 +2,11 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : R2 单电机(ID3)伸缩机构测试 - 3秒平滑插值伸缩与抗拒外力保持
+  * @brief          : 3轴电机 + 1轴舵机 + 气路吸盘 全自动流程 (纯净修复版)
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -19,10 +20,10 @@
 /* USER CODE BEGIN PTD */
 typedef struct {
     int16_t speed_rpm;
-    uint16_t ecd;          
-    uint16_t last_ecd;     
-    int32_t total_round;   
-    int32_t total_ecd;     
+    uint16_t ecd;
+    uint16_t last_ecd;
+    int32_t total_round;
+    int32_t total_ecd;
 } Motor_Measure_t;
 
 typedef struct {
@@ -35,33 +36,48 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// 电机尾部（转子）转17圈对应的绝对 Ticks 数
-// 【注意】如果伸出方向是反的，请改成 -(17 * 8192)
-#define EXTEND_POS  (17 * 8192) 
+// ----------------- 根据实测修正的最终物理参数 -----------------
+#define LIFT_TARGET_30     (20 * 8192)   // ID1: 第一阶段抬升 20 圈
+#define LIFT_TARGET_40     (60 * 8192)   // ID1: 第二阶段抬升至 60 圈
+#define EXTEND_TARGET_OUT  (13 * 8192)   // ID3: 伸出 13 圈
+#define EXTEND_TARGET_IN   (-10 * 8192)  // ID3: 缩回 -10 圈归零
+
+/* 旋转/俯仰 ID2 参数 */
+#define PITCH_90_TARGET    (int32_t)(-53.0f * 8192.0f) // 实测 90° 对应 -53 圈
+#define PITCH_45_TARGET    (int32_t)(-26.5f * 8192.0f) // 45° 对应 -26.5 圈
+
+// ----------------- 气动吸盘原生控制宏 -----------------
+#define RELAY_PORT         GPIOB
+#define RELAY_PIN          GPIO_PIN_12
+#define CATCH_CLAMP()      HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET) // 低电平吸气
+#define CATCH_RELEASE()    HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_SET)   // 高电平放气
 /* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
+
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim6;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
-Motor_Measure_t motor[4]; // 数组索引：2对应ID3
-PID_t pos_pid[4], spd_pid[4];
+Motor_Measure_t motor[3];
+PID_t pos_pid[3], spd_pid[3];
 
-int32_t target_pos = 0;      // 目标位置
-float target_speed = 0;      // 目标速度
-int16_t send_current = 0;    // 发送电流
+int32_t target_pos[3] = {0, 0, 0};
+int16_t send_current[3] = {0, 0, 0};
 
-uint8_t is_init = 0;
-int32_t offset_ecd = 0;
+uint8_t is_init[3] = {0, 0, 0};
+int32_t offset_ecd[3] = {0, 0, 0};
 
-uint8_t arm_state = 0;       // 状态机阶段
-uint32_t state_timer = 0;    // 计时器 (单位:ms)
+uint8_t sys_state = 0;
+uint32_t state_timer = 0;
+
+float current_servo_angle = 135.0f;  // 舵机始终保持在 0° (135.0f)
+
+volatile uint32_t debug_id_1 = 0;
+volatile uint32_t debug_id_2 = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -69,10 +85,13 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM1_Init(void);
 
 /* USER CODE BEGIN PFP */
 float PID_Calc(PID_t *pid, float target, float measure);
 void CAN_Filter_Init(CAN_HandleTypeDef *hcan);
+void Set_Servo_Angle(float angle);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -87,6 +106,13 @@ float PID_Calc(PID_t *pid, float target, float measure) {
     if(pid->output > pid->max_output) pid->output = pid->max_output;
     else if(pid->output < -pid->max_output) pid->output = -pid->max_output;
     return pid->output;
+}
+
+void Set_Servo_Angle(float angle) {
+    if(angle < 0) angle = 0;
+    if(angle > 270.0f) angle = 270.0f;
+    uint32_t pwm_val = 500 + (uint32_t)((angle / 270.0f) * 2000.0f);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm_val);
 }
 
 void CAN_Filter_Init(CAN_HandleTypeDef *hcan) {
@@ -113,135 +139,38 @@ int main(void)
   MX_GPIO_Init();
   MX_CAN1_Init();
   MX_TIM6_Init();
-
+  MX_USART1_UART_Init();
+  MX_TIM1_Init();
+  
   /* USER CODE BEGIN 2 */
-  // ================= PID 初始化 (仅配置 ID3，数组索引为 2) =================
-  // 【优化点】：Kp提升到0.3，max_output放宽到4000，增强抗机械阻力刚性
-  pos_pid[2].Kp = 0.3f; 
-  pos_pid[2].max_output = 4000; 
-
-  spd_pid[2].Kp = 5.0f;  
-  spd_pid[2].Ki = 0.1f; 
-  spd_pid[2].max_output = 8000; 
+  for(int i=0; i<3; i++) {
+      pos_pid[i].Kp = 0.3f; 
+      pos_pid[i].max_output = 4000; 
+      spd_pid[i].Kp = 5.0f;  
+      spd_pid[i].Ki = 0.1f; 
+      spd_pid[i].max_integral = 5000; 
+      spd_pid[i].max_output = 8000; 
+  }
+  pos_pid[1].Kp = 0.8f; 
 
   CAN_Filter_Init(&hcan1);
   HAL_CAN_Start(&hcan1);
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
   
-  // 启动控制心跳
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  Set_Servo_Angle(135.0f); // 舵机锁定在 0°
+  
+  CATCH_RELEASE(); // 上电默认放气
+
   HAL_TIM_Base_Start_IT(&htim6);
   /* USER CODE END 2 */
 
   while (1)
   {
-    /* USER CODE BEGIN 3 */
     HAL_Delay(10);
   }
-  /* USER CODE END 3 */
 }
 
-/* USER CODE BEGIN 4 */
-// ================= CAN 接收：上电归零与多圈解算 =================
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-    CAN_RxHeaderTypeDef rx_header;
-    uint8_t rx_data[8];
-    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
-
-    // 只过滤接收 ID3 (0x203) 的数据
-    if (rx_header.StdId == 0x203) {
-        uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
-        
-        // 上电第一次记录初始位置
-        if (!is_init) {
-            offset_ecd = current_ecd;
-            is_init = 1;
-            return;
-        }
-
-        motor[2].last_ecd = motor[2].ecd;
-        motor[2].ecd = current_ecd;
-        motor[2].speed_rpm = (rx_data[2] << 8) | rx_data[3];
-        
-        int16_t diff = motor[2].ecd - motor[2].last_ecd;
-        if (diff < -4096) motor[2].total_round++;
-        else if (diff > 4096) motor[2].total_round--;
-        
-        motor[2].total_ecd = motor[2].total_round * 8192 + motor[2].ecd - offset_ecd;
-    }
-}
-
-// ================= 1ms 定时器：状态机与串级 PID =================
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM6) {
-        
-        // --- 核心时序状态机 (加入浮点线性轨迹规划) ---
-        switch(arm_state) {
-            case 0: // 阶段1：3秒内平滑匀速伸出
-                state_timer++;
-                // 使用 float 防止整数运算溢出截断
-                target_pos = (int32_t)(((float)EXTEND_POS * (float)state_timer) / 3000.0f); 
-                
-                if(state_timer >= 3000) { 
-                    target_pos = EXTEND_POS; 
-                    arm_state = 1; 
-                    state_timer = 0; 
-                }
-                break;
-                
-            case 1: // 阶段2：到达最长处，保持静止并抵抗外力 5 秒
-                target_pos = EXTEND_POS; 
-                state_timer++;
-                if(state_timer >= 5000) { 
-                    arm_state = 2; 
-                    state_timer = 0; 
-                }
-                break;
-                
-            case 2: // 阶段3：3秒内平滑匀速缩回
-                state_timer++;
-                // 回程同样使用 float 平滑计算
-                target_pos = EXTEND_POS - (int32_t)(((float)EXTEND_POS * (float)state_timer) / 3000.0f);
-                
-                if(state_timer >= 3000) { 
-                    target_pos = 0; 
-                    arm_state = 3; 
-                    state_timer = 0; 
-                }
-                break;
-                
-            case 3: // 阶段4：在最短处停顿 2 秒后循环
-                target_pos = 0;
-                state_timer++;
-                if(state_timer >= 2000) { 
-                    arm_state = 0; 
-                    state_timer = 0; 
-                }
-                break;
-        }
-
-        // --- 串级 PID 计算 (使用索引 2) ---
-        target_speed = PID_Calc(&pos_pid[2], (float)target_pos, (float)motor[2].total_ecd);
-        send_current = (int16_t)PID_Calc(&spd_pid[2], target_speed, (float)motor[2].speed_rpm);
-
-        // --- CAN 打包与发送 ---
-        CAN_TxHeaderTypeDef tx_header = {0x200, 0, CAN_ID_STD, CAN_RTR_DATA, 8};
-        uint8_t tx_data[8] = {0};
-        uint32_t tx_mailbox;
-        
-        // 封包 ID3，对应 data[4] 和 data[5]
-        tx_data[4] = send_current >> 8; 
-        tx_data[5] = send_current & 0xFF;
-        
-        HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
-    }
-}
-/* USER CODE END 4 */
-
-/**
-  * @brief System Clock Configuration
-  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -287,31 +216,248 @@ static void MX_CAN1_Init(void)
   if (HAL_CAN_Init(&hcan1) != HAL_OK) { Error_Handler(); }
 }
 
+static void MX_TIM1_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 167;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 19999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) { Error_Handler(); }
+  
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) { Error_Handler(); }
+  
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) { Error_Handler(); }
+  
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) { Error_Handler(); }
+  
+  HAL_TIM_MspPostInit(&htim1);
+}
+
 static void MX_TIM6_Init(void)
 {
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 83;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim6.Init.Period = 999;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK) { Error_Handler(); }
+  
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
+}
+
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE(); 
+
+  // 原生气动引脚配置
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); 
+  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
+
+/* USER CODE BEGIN 4 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef rx_header;
+    uint8_t rx_data[8];
+    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
+
+    if (rx_header.StdId >= 0x201 && rx_header.StdId <= 0x203) {
+        uint8_t idx = rx_header.StdId - 0x201; 
+        uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
+        if (!is_init[idx]) {
+            offset_ecd[idx] = current_ecd;
+            is_init[idx] = 1;
+            return;
+        }
+        motor[idx].last_ecd = motor[idx].ecd;
+        motor[idx].ecd = current_ecd;
+        motor[idx].speed_rpm = (rx_data[2] << 8) | rx_data[3];
+        int16_t diff = motor[idx].ecd - motor[idx].last_ecd;
+        if (diff < -4096) motor[idx].total_round++;
+        else if (diff > 4096) motor[idx].total_round--;
+        motor[idx].total_ecd = motor[idx].total_round * 8192 + motor[idx].ecd - offset_ecd[idx];
+    }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6) {
+        if(is_init[0] && is_init[1] && is_init[2]) {
+            
+            switch(sys_state) {
+                case 0: // 抬升 20 圈 (3秒)
+                    state_timer++;
+                    target_pos[0] = (int32_t)(((float)LIFT_TARGET_30 * (float)state_timer) / 3000.0f);
+                    target_pos[1] = 0; 
+                    if(state_timer >= 3000) { sys_state = 1; state_timer = 0; target_pos[0] = LIFT_TARGET_30; }
+                    break;
+                    
+                case 1: // 静止 2s
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 2; state_timer = 0; }
+                    break;
+
+                case 2: // 伸出 (2秒)
+                    state_timer++;
+                    target_pos[2] = (int32_t)(((float)EXTEND_TARGET_OUT * (float)state_timer) / 2000.0f);
+                    if(state_timer >= 2000) { sys_state = 3; state_timer = 0; target_pos[2] = EXTEND_TARGET_OUT; }
+                    break;
+                    
+                case 3: // 静止 2s
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 4; state_timer = 0; }
+                    break;
+                    
+                case 4: // 开始吸气
+                    CATCH_CLAMP();
+                    sys_state = 5;
+                    state_timer = 0;
+                    break;
+                    
+                case 5: // 静止 2s (稳固吸附)
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 6; state_timer = 0; }
+                    break;
+                    
+                case 6: // 继续抬升至 60 圈 (耗时 5 秒平滑过渡)
+                    state_timer++;
+                    float lift_time_ms = 5000.0f;
+                    int32_t remain_dist = LIFT_TARGET_40 - LIFT_TARGET_30;
+                    target_pos[0] = LIFT_TARGET_30 + (int32_t)((float)remain_dist * ((float)state_timer / lift_time_ms));
+                    if(state_timer >= (uint32_t)lift_time_ms) { sys_state = 7; state_timer = 0; target_pos[0] = LIFT_TARGET_40; }
+                    break;
+                    
+                case 7: // 静止 2s
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 8; state_timer = 0; }
+                    break;
+                    
+                case 8: // ID2 电机缓慢向上运动 45° (3秒)
+                    state_timer++;
+                    target_pos[1] = (int32_t)((float)PITCH_45_TARGET * ((float)state_timer / 3000.0f));
+                    if(state_timer >= 3000) { sys_state = 9; state_timer = 0; target_pos[1] = PITCH_45_TARGET; }
+                    break;
+                    
+                case 9: // 静止 2s
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 10; state_timer = 0; }
+                    break;
+                    
+                case 10: // ID2 电机缓慢转回 0° (3秒)
+                    state_timer++;
+                    target_pos[1] = PITCH_45_TARGET - (int32_t)((float)PITCH_45_TARGET * ((float)state_timer / 3000.0f));
+                    if(state_timer >= 3000) { sys_state = 11; state_timer = 0; target_pos[1] = 0; }
+                    break;
+                    
+                case 11: // 静止 2s
+                    state_timer++;
+                    if(state_timer >= 2000) { sys_state = 12; state_timer = 0; }
+                    break;
+
+                case 12: // 放气释放
+                    CATCH_RELEASE();
+                    sys_state = 13;
+                    state_timer = 0;
+                    break;
+
+                case 13: // 下降 & 缩回归零 (4s)
+                    state_timer++;
+                    target_pos[0] = LIFT_TARGET_40 - (int32_t)(((float)LIFT_TARGET_40 * (float)state_timer) / 4000.0f);
+                    target_pos[2] = EXTEND_TARGET_OUT - (int32_t)(((float)(23 * 8192) * (float)state_timer) / 4000.0f);
+                    if(state_timer >= 4000) { 
+                        sys_state = 14; 
+                        state_timer = 0; 
+                        target_pos[0] = 0;
+                        target_pos[2] = EXTEND_TARGET_IN;
+                    }
+                    break;
+
+                case 14: // 结尾停顿 & 清除伸缩误差
+                    state_timer++;
+                    motor[2].total_ecd = 0;
+                    motor[2].total_round = 0;
+                    target_pos[2] = 0;
+                    if(state_timer >= 2000) { sys_state = 0; state_timer = 0; }
+                    break;
+            }
+
+            Set_Servo_Angle(current_servo_angle);
+
+            for(int i=0; i<3; i++) {
+                float target_speed = PID_Calc(&pos_pid[i], (float)target_pos[i], (float)motor[i].total_ecd);
+                send_current[i] = (int16_t)PID_Calc(&spd_pid[i], target_speed, (float)motor[i].speed_rpm);
+            }
+
+            CAN_TxHeaderTypeDef tx_header = {0x200, 0, CAN_ID_STD, CAN_RTR_DATA, 8};
+            uint8_t tx_data[8] = {0};
+            uint32_t tx_mailbox;
+            tx_data[0] = send_current[0] >> 8; 
+            tx_data[1] = send_current[0] & 0xFF;
+            tx_data[2] = send_current[1] >> 8; 
+            tx_data[3] = send_current[1] & 0xFF;
+            tx_data[4] = send_current[2] >> 8; 
+            tx_data[5] = send_current[2] & 0xFF;
+            HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+        }
+    }
+}
+/* USER CODE END 4 */
 
 void Error_Handler(void)
 {
   __disable_irq();
   while (1) { }
 }
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) { }
+#endif 
+/* USE_FULL_ASSERT */

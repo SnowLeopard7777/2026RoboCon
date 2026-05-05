@@ -1,616 +1,493 @@
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    stm32f4xx_hal.c
-  * @author  MCD Application Team
-  * @brief   HAL module driver.
-  *          This is the common part of the HAL initialization
-  *
+  * @file           : main.c
+  * @brief          : 3轴电机(ID1/2/3) + 1轴舵机 多轴时序协同控制 (原生PE14驱动)
   ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2017 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  @verbatim
-  ==============================================================================
-                     ##### How to use this driver #####
-  ==============================================================================
-    [..]
-    The common HAL driver contains a set of generic and common APIs that can be
-    used by the PPP peripheral drivers and the user to start using the HAL. 
-    [..]
-    The HAL contains two APIs' categories: 
-         (+) Common HAL APIs
-         (+) Services HAL APIs
-
-  @endverbatim
-  ******************************************************************************
-  */ 
-
+  */
+/* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "stm32f4xx_hal.h"
+#include "main.h"
 
-/** @addtogroup STM32F4xx_HAL_Driver
-  * @{
-  */
-
-/** @defgroup HAL HAL
-  * @brief HAL module driver.
-  * @{
-  */
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "math.h"
+#include "stdlib.h"
+/* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct {
+    int16_t speed_rpm;
+    uint16_t ecd;          
+    uint16_t last_ecd;     
+    int32_t total_round;   
+    int32_t total_ecd;     
+} Motor_Measure_t;
+
+typedef struct {
+    float Kp, Ki, Kd;
+    float error, last_error;
+    float integral, max_integral;
+    float output, max_output;
+} PID_t;
+/* USER CODE END PTD */
+
 /* Private define ------------------------------------------------------------*/
-/** @addtogroup HAL_Private_Constants
-  * @{
-  */
-/**
-  * @brief STM32F4xx HAL Driver version number V1.8.5
-  */
-#define __STM32F4xx_HAL_VERSION_MAIN   (0x01U) /*!< [31:24] main version */
-#define __STM32F4xx_HAL_VERSION_SUB1   (0x08U) /*!< [23:16] sub1 version */
-#define __STM32F4xx_HAL_VERSION_SUB2   (0x05U) /*!< [15:8]  sub2 version */
-#define __STM32F4xx_HAL_VERSION_RC     (0x00U) /*!< [7:0]  release candidate */ 
-#define __STM32F4xx_HAL_VERSION         ((__STM32F4xx_HAL_VERSION_MAIN << 24U)\
-                                        |(__STM32F4xx_HAL_VERSION_SUB1 << 16U)\
-                                        |(__STM32F4xx_HAL_VERSION_SUB2 << 8U )\
-                                        |(__STM32F4xx_HAL_VERSION_RC))
-                                        
-#define IDCODE_DEVID_MASK    0x00000FFFU
+/* USER CODE BEGIN PD */
+// ----------------- 各轴运动极限参数 (单位: ticks) -----------------
+#define LIFT_TARGET        (30 * 8192)  // ID1: 抬升30圈
+#define EXTEND_TARGET_OUT  (17 * 8192)  // ID3: 伸缩伸出17圈
+#define EXTEND_TARGET_IN   (-3 * 8192)  // ID3: 伸缩缩回至-3圈 (多退3圈用于撞击限位归零)
 
-/* ------------ RCC registers bit address in the alias region ----------- */
-#define SYSCFG_OFFSET             (SYSCFG_BASE - PERIPH_BASE)
-/* ---  MEMRMP Register ---*/ 
-/* Alias word address of UFB_MODE bit */ 
-#define MEMRMP_OFFSET             SYSCFG_OFFSET 
-#define UFB_MODE_BIT_NUMBER       SYSCFG_MEMRMP_UFB_MODE_Pos
-#define UFB_MODE_BB               (uint32_t)(PERIPH_BB_BASE + (MEMRMP_OFFSET * 32U) + (UFB_MODE_BIT_NUMBER * 4U)) 
-
-/* ---  CMPCR Register ---*/ 
-/* Alias word address of CMP_PD bit */ 
-#define CMPCR_OFFSET              (SYSCFG_OFFSET + 0x20U) 
-#define CMP_PD_BIT_NUMBER         SYSCFG_CMPCR_CMP_PD_Pos
-#define CMPCR_CMP_PD_BB           (uint32_t)(PERIPH_BB_BASE + (CMPCR_OFFSET * 32U) + (CMP_PD_BIT_NUMBER * 4U))
-
-/* ---  MCHDLYCR Register ---*/ 
-/* Alias word address of BSCKSEL bit */ 
-#define MCHDLYCR_OFFSET            (SYSCFG_OFFSET + 0x30U) 
-#define BSCKSEL_BIT_NUMBER         SYSCFG_MCHDLYCR_BSCKSEL_Pos
-#define MCHDLYCR_BSCKSEL_BB        (uint32_t)(PERIPH_BB_BASE + (MCHDLYCR_OFFSET * 32U) + (BSCKSEL_BIT_NUMBER * 4U))
-/**
-  * @}
-  */
+/* 俯仰电机 90° 计算: 
+   如果使用 M3508 (减速比19.2)，输出轴90° = 电机转4.8圈 = 4.8 * 8192 = 39321
+   如果使用 M2006 (减速比36)，输出轴90° = 电机转9圈 = 9 * 8192 = 73728 */
+#define PITCH_90_TARGET    (int32_t)(4.8f * 8192.0f) // ID2: 抬起90度
+/* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
 /* Private variables ---------------------------------------------------------*/
-/** @addtogroup HAL_Private_Variables
-  * @{
-  */
-__IO uint32_t uwTick;
-uint32_t uwTickPrio   = (1UL << __NVIC_PRIO_BITS); /* Invalid PRIO */
-HAL_TickFreqTypeDef uwTickFreq = HAL_TICK_FREQ_DEFAULT;  /* 1KHz */
-/**
-  * @}
-  */
+CAN_HandleTypeDef hcan1;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim6;
+
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+// 数组大小为3，分别对应 ID1(下标0), ID2(下标1), ID3(下标2)
+Motor_Measure_t motor[3]; 
+PID_t pos_pid[3], spd_pid[3];
+
+int32_t target_pos[3] = {0, 0, 0};   // 3个电机的目标位置
+int16_t send_current[3] = {0, 0, 0}; // 3个电机的发送电流
+
+uint8_t is_init[3] = {0, 0, 0};      // 3个电机的初始化标志
+int32_t offset_ecd[3] = {0, 0, 0};   // 3个电机的上电初始绝对值
+
+uint8_t sys_state = 0;               // 状态机阶段
+uint32_t state_timer = 0;            // 计时器 (单位:ms)
+
+float current_servo_angle = 135.0f;  // 当前舵机角度
+
+volatile uint32_t debug_id_1 = 0;
+volatile uint32_t debug_id_2 = 0;
+
+/* USER CODE END PV */
+
 /* Private function prototypes -----------------------------------------------*/
-/* Private functions ---------------------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_CAN1_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+float PID_Calc(PID_t *pid, float target, float measure);
+void CAN_Filter_Init(CAN_HandleTypeDef *hcan);
+void Set_Servo_Angle(float angle);
+/* USER CODE END PFP */
 
-/** @defgroup HAL_Exported_Functions HAL Exported Functions
-  * @{
-  */
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+float PID_Calc(PID_t *pid, float target, float measure) {
+    pid->error = target - measure;
+    pid->integral += pid->error;
+    if(pid->integral > pid->max_integral) pid->integral = pid->max_integral;
+    else if(pid->integral < -pid->max_integral) pid->integral = -pid->max_integral;
+    pid->output = pid->Kp * pid->error + pid->Ki * pid->integral + pid->Kd * (pid->error - pid->last_error);
+    pid->last_error = pid->error;
+    if(pid->output > pid->max_output) pid->output = pid->max_output;
+    else if(pid->output < -pid->max_output) pid->output = -pid->max_output;
+    return pid->output;
+}
 
-/** @defgroup HAL_Exported_Functions_Group1 Initialization and de-initialization Functions 
- *  @brief    Initialization and de-initialization functions
- *
-@verbatim    
- ===============================================================================
-              ##### Initialization and Configuration functions #####
- ===============================================================================
-    [..]  This section provides functions allowing to:
-      (+) Initializes the Flash interface the NVIC allocation and initial clock 
-          configuration. It initializes the systick also when timeout is needed 
-          and the backup domain when enabled.
-      (+) De-Initializes common part of the HAL.
-      (+) Configure the time base source to have 1ms time base with a dedicated 
-          Tick interrupt priority. 
-        (++) SysTick timer is used by default as source of time base, but user
-             can eventually implement his proper time base source (a general purpose 
-             timer for example or other time source), keeping in mind that Time base 
-             duration should be kept 1ms since PPP_TIMEOUT_VALUEs are defined and 
-             handled in milliseconds basis.
-        (++) Time base configuration function (HAL_InitTick ()) is called automatically 
-             at the beginning of the program after reset by HAL_Init() or at any time 
-             when clock is configured, by HAL_RCC_ClockConfig(). 
-        (++) Source of time base is configured  to generate interrupts at regular 
-             time intervals. Care must be taken if HAL_Delay() is called from a 
-             peripheral ISR process, the Tick interrupt line must have higher priority 
-            (numerically lower) than the peripheral interrupt. Otherwise the caller 
-            ISR process will be blocked. 
-       (++) functions affecting time base configurations are declared as __weak  
-             to make  override possible  in case of other  implementations in user file.
-@endverbatim
-  * @{
-  */
+// 设置舵机 PWM 值 (原生支持 PE14 TIM1_CH4)
+void Set_Servo_Angle(float angle) {
+    if(angle < 0) angle = 0;
+    if(angle > 270.0f) angle = 270.0f;
+    uint32_t pwm_val = 500 + (uint32_t)((angle / 270.0f) * 2000.0f);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm_val);
+}
+
+void CAN_Filter_Init(CAN_HandleTypeDef *hcan) {
+    CAN_FilterTypeDef can_filter;
+    can_filter.FilterBank = 0;
+    can_filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    can_filter.FilterScale = CAN_FILTERSCALE_32BIT;
+    can_filter.FilterIdHigh = 0x0000;
+    can_filter.FilterIdLow = 0x0000;
+    can_filter.FilterMaskIdHigh = 0x0000;
+    can_filter.FilterMaskIdLow = 0x0000;
+    can_filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+    can_filter.FilterActivation = ENABLE;
+    can_filter.SlaveStartFilterBank = 14;
+    HAL_CAN_ConfigFilter(hcan, &can_filter);
+}
+/* USER CODE END 0 */
 
 /**
-  * @brief  This function is used to initialize the HAL Library; it must be the first 
-  *         instruction to be executed in the main program (before to call any other
-  *         HAL function), it performs the following:
-  *           Configure the Flash prefetch, instruction and Data caches.
-  *           Configures the SysTick to generate an interrupt each 1 millisecond,
-  *           which is clocked by the HSI (at this stage, the clock is not yet
-  *           configured and thus the system is running from the internal HSI at 16 MHz).
-  *           Set NVIC Group Priority to 4.
-  *           Calls the HAL_MspInit() callback function defined in user file 
-  *           "stm32f4xx_hal_msp.c" to do the global low level hardware initialization 
-  *            
-  * @note   SysTick is used as time base for the HAL_Delay() function, the application
-  *         need to ensure that the SysTick time base is always set to 1 millisecond
-  *         to have correct HAL operation.
-  * @retval HAL status
+  * @brief  The application entry point.
+  * @retval int
   */
-HAL_StatusTypeDef HAL_Init(void)
+int main(void)
 {
-  /* Configure Flash prefetch, Instruction cache, Data cache */ 
-#if (INSTRUCTION_CACHE_ENABLE != 0U)
-  __HAL_FLASH_INSTRUCTION_CACHE_ENABLE();
-#endif /* INSTRUCTION_CACHE_ENABLE */
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
 
-#if (DATA_CACHE_ENABLE != 0U)
-  __HAL_FLASH_DATA_CACHE_ENABLE();
-#endif /* DATA_CACHE_ENABLE */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_CAN1_Init();
+  MX_TIM6_Init();
+  MX_USART1_UART_Init();
+  MX_TIM1_Init();
+  
+  /* USER CODE BEGIN 2 */
+  /* ================= 统一初始化 3 个电机的 PID ================= */
+  for(int i=0; i<3; i++) {
+      pos_pid[i].Kp = 0.3f; 
+      pos_pid[i].max_output = 4000; 
 
-#if (PREFETCH_ENABLE != 0U)
-  __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
-#endif /* PREFETCH_ENABLE */
+      spd_pid[i].Kp = 5.0f;  
+      spd_pid[i].Ki = 0.1f; 
+      spd_pid[i].max_integral = 5000; 
+      spd_pid[i].max_output = 8000; 
+  }
+  // 旋转(俯仰)电机 ID2 承受重力，位置环可以稍微硬一点
+  pos_pid[1].Kp = 0.6f; 
 
-  /* Set Interrupt Group Priority */
-  HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
+  CAN_Filter_Init(&hcan1);
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+  
+  // 启动舵机 PWM 输出与 1ms 控制心跳
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  Set_Servo_Angle(135.0f); // 初始姿态 135° (绝对中位)
+  
+  HAL_TIM_Base_Start_IT(&htim6);
+  /* USER CODE END 2 */
 
-  /* Use systick as time base source and configure 1ms tick (default clock after Reset is HSI) */
-  HAL_InitTick(TICK_INT_PRIORITY);
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
 
-  /* Init the low level hardware */
-  HAL_MspInit();
-
-  /* Return function status */
-  return HAL_OK;
+    /* USER CODE BEGIN 3 */
+    HAL_Delay(10);
+  }
+  /* USER CODE END 3 */
 }
 
 /**
-  * @brief  This function de-Initializes common part of the HAL and stops the systick.
-  *         This function is optional.   
-  * @retval HAL status
-  */
-HAL_StatusTypeDef HAL_DeInit(void)
-{
-  /* Reset of all peripherals */
-  __HAL_RCC_APB1_FORCE_RESET();
-  __HAL_RCC_APB1_RELEASE_RESET();
-
-  __HAL_RCC_APB2_FORCE_RESET();
-  __HAL_RCC_APB2_RELEASE_RESET();
-
-  __HAL_RCC_AHB1_FORCE_RESET();
-  __HAL_RCC_AHB1_RELEASE_RESET();
-
-  __HAL_RCC_AHB2_FORCE_RESET();
-  __HAL_RCC_AHB2_RELEASE_RESET();
-
-  __HAL_RCC_AHB3_FORCE_RESET();
-  __HAL_RCC_AHB3_RELEASE_RESET();
-
-  /* De-Init the low level hardware */
-  HAL_MspDeInit();
-    
-  /* Return function status */
-  return HAL_OK;
-}
-
-/**
-  * @brief  Initialize the MSP.
+  * @brief System Clock Configuration
   * @retval None
   */
-__weak void HAL_MspInit(void)
+void SystemClock_Config(void)
 {
-  /* NOTE : This function should not be modified, when the callback is needed,
-            the HAL_MspInit could be implemented in the user file
-   */
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 6;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { Error_Handler(); }
 }
 
 /**
-  * @brief  DeInitializes the MSP.
-  * @retval None
+  * @brief CAN1 Initialization Function
   */
-__weak void HAL_MspDeInit(void)
+static void MX_CAN1_Init(void)
 {
-  /* NOTE : This function should not be modified, when the callback is needed,
-            the HAL_MspDeInit could be implemented in the user file
-   */ 
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 3;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK) { Error_Handler(); }
 }
 
 /**
-  * @brief This function configures the source of the time base.
-  *        The time source is configured  to have 1ms time base with a dedicated 
-  *        Tick interrupt priority.
-  * @note This function is called  automatically at the beginning of program after
-  *       reset by HAL_Init() or at any time when clock is reconfigured  by HAL_RCC_ClockConfig().
-  * @note In the default implementation, SysTick timer is the source of time base. 
-  *       It is used to generate interrupts at regular time intervals. 
-  *       Care must be taken if HAL_Delay() is called from a peripheral ISR process, 
-  *       The SysTick interrupt must have higher priority (numerically lower)
-  *       than the peripheral interrupt. Otherwise the caller ISR process will be blocked.
-  *       The function is declared as __weak  to be overwritten  in case of other
-  *       implementation  in user file.
-  * @param TickPriority Tick interrupt priority.
-  * @retval HAL status
+  * @brief TIM1 Initialization Function
   */
-__weak HAL_StatusTypeDef HAL_InitTick(uint32_t TickPriority)
+static void MX_TIM1_Init(void)
 {
-  /* Configure the SysTick to have interrupt in 1ms time basis*/
-  if (HAL_SYSTICK_Config(SystemCoreClock / (1000U / uwTickFreq)) > 0U)
-  {
-    return HAL_ERROR;
-  }
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-  /* Configure the SysTick IRQ priority */
-  if (TickPriority < (1UL << __NVIC_PRIO_BITS))
-  {
-    HAL_NVIC_SetPriority(SysTick_IRQn, TickPriority, 0U);
-    uwTickPrio = TickPriority;
-  }
-  else
-  {
-    return HAL_ERROR;
-  }
-
-  /* Return function status */
-  return HAL_OK;
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 167;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 19999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) { Error_Handler(); }
+  
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) { Error_Handler(); }
+  
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) { Error_Handler(); }
+  
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) { Error_Handler(); }
+  
+  HAL_TIM_MspPostInit(&htim1);
 }
 
 /**
-  * @}
+  * @brief TIM6 Initialization Function
   */
-
-/** @defgroup HAL_Exported_Functions_Group2 HAL Control functions 
- *  @brief    HAL Control functions
- *
-@verbatim
- ===============================================================================
-                      ##### HAL Control functions #####
- ===============================================================================
-    [..]  This section provides functions allowing to:
-      (+) Provide a tick value in millisecond
-      (+) Provide a blocking delay in millisecond
-      (+) Suspend the time base source interrupt
-      (+) Resume the time base source interrupt
-      (+) Get the HAL API driver version
-      (+) Get the device identifier
-      (+) Get the device revision identifier
-      (+) Enable/Disable Debug module during SLEEP mode
-      (+) Enable/Disable Debug module during STOP mode
-      (+) Enable/Disable Debug module during STANDBY mode
-
-@endverbatim
-  * @{
-  */
-
-/**
-  * @brief This function is called to increment  a global variable "uwTick"
-  *        used as application time base.
-  * @note In the default implementation, this variable is incremented each 1ms
-  *       in SysTick ISR.
- * @note This function is declared as __weak to be overwritten in case of other 
-  *      implementations in user file.
-  * @retval None
-  */
-__weak void HAL_IncTick(void)
+static void MX_TIM6_Init(void)
 {
-  uwTick += uwTickFreq;
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 83;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK) { Error_Handler(); }
+  
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
 /**
-  * @brief Provides a tick value in millisecond.
-  * @note This function is declared as __weak to be overwritten in case of other 
-  *       implementations in user file.
-  * @retval tick value
+  * @brief USART1 Initialization Function
   */
-__weak uint32_t HAL_GetTick(void)
+static void MX_USART1_UART_Init(void)
 {
-  return uwTick;
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
 }
 
 /**
-  * @brief This function returns a tick priority.
-  * @retval tick priority
+  * @brief GPIO Initialization Function
   */
-uint32_t HAL_GetTickPrio(void)
+static void MX_GPIO_Init(void)
 {
-  return uwTickPrio;
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
 }
 
-/**
-  * @brief Set new tick Freq.
-  * @retval Status
-  */
-HAL_StatusTypeDef HAL_SetTickFreq(HAL_TickFreqTypeDef Freq)
+/* USER CODE BEGIN 4 */
+/* ================= CAN 接收：三轴并发解算 ================= */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-  HAL_StatusTypeDef status  = HAL_OK;
-  HAL_TickFreqTypeDef prevTickFreq;
+    CAN_RxHeaderTypeDef rx_header;
+    uint8_t rx_data[8];
+    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
 
-  assert_param(IS_TICKFREQ(Freq));
-
-  if (uwTickFreq != Freq)
-  {
-    /* Back up uwTickFreq frequency */
-    prevTickFreq = uwTickFreq;
-
-    /* Update uwTickFreq global variable used by HAL_InitTick() */
-    uwTickFreq = Freq;
-
-    /* Apply the new tick Freq  */
-    status = HAL_InitTick(uwTickPrio);
-
-    if (status != HAL_OK)
-    {
-      /* Restore previous tick frequency */
-      uwTickFreq = prevTickFreq;
+    if(rx_header.StdId != 0x203) { 
+        if(debug_id_1 == 0) debug_id_1 = rx_header.StdId;
+        else if(rx_header.StdId != debug_id_1) debug_id_2 = rx_header.StdId;
     }
-  }
 
-  return status;
+    if (rx_header.StdId >= 0x201 && rx_header.StdId <= 0x203) {
+        uint8_t idx = rx_header.StdId - 0x201; 
+        uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
+        
+        if (!is_init[idx]) {
+            offset_ecd[idx] = current_ecd;
+            is_init[idx] = 1;
+            return;
+        }
+
+        motor[idx].last_ecd = motor[idx].ecd;
+        motor[idx].ecd = current_ecd;
+        motor[idx].speed_rpm = (rx_data[2] << 8) | rx_data[3];
+        
+        int16_t diff = motor[idx].ecd - motor[idx].last_ecd;
+        if (diff < -4096) motor[idx].total_round++;
+        else if (diff > 4096) motor[idx].total_round--;
+        
+        motor[idx].total_ecd = motor[idx].total_round * 8192 + motor[idx].ecd - offset_ecd[idx];
+    }
 }
 
-/**
-  * @brief Return tick frequency.
-  * @retval Tick frequency.
-  *         Value of @ref HAL_TickFreqTypeDef.
-  */
-HAL_TickFreqTypeDef HAL_GetTickFreq(void)
+/* ================= 1ms 定时器：全剧本状态机与 3 轴 PID ================= */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  return uwTickFreq;
-}
+    if (htim->Instance == TIM6) {
+        
+        // 【核心保护】必须等 3 个电机全部上线，才允许运行控制逻辑
+        if(is_init[0] && is_init[1] && is_init[2]) {
+            
+            // --- 多轴时序剧本状态机 ---
+            switch(sys_state) {
+                case 0: // 阶段0：缓慢抬升 4s
+                    state_timer++;
+                    target_pos[0] = (int32_t)(((float)LIFT_TARGET * (float)state_timer) / 4000.0f);
+                    target_pos[1] = 0; // 俯仰保持水平
+                    current_servo_angle = 135.0f;
+                    if(state_timer >= 4000) { sys_state = 1; state_timer = 0; target_pos[0] = LIFT_TARGET; }
+                    break;
+                    
+                case 1: // 阶段1：稳定高度静止 3s
+                    state_timer++;
+                    if(state_timer >= 3000) { sys_state = 2; state_timer = 0; }
+                    break;
 
-/**
-  * @brief This function provides minimum delay (in milliseconds) based 
-  *        on variable incremented.
-  * @note In the default implementation , SysTick timer is the source of time base.
-  *       It is used to generate interrupts at regular time intervals where uwTick
-  *       is incremented.
-  * @note This function is declared as __weak to be overwritten in case of other
-  *       implementations in user file.
-  * @param Delay specifies the delay time length, in milliseconds.
-  * @retval None
-  */
-__weak void HAL_Delay(uint32_t Delay)
+                // ===== 新增：俯仰角抬起 90° 动作 =====
+                case 2: // 阶段2：吸盘端向上抬起 90° (耗时 3s)
+                    state_timer++;
+                    target_pos[1] = (int32_t)(((float)PITCH_90_TARGET * (float)state_timer) / 3000.0f);
+                    if(state_timer >= 3000) { sys_state = 3; state_timer = 0; target_pos[1] = PITCH_90_TARGET; }
+                    break;
+                    
+                case 3: // 阶段3：吸盘抬起 90° 状态下静止 3s
+                    state_timer++;
+                    if(state_timer >= 3000) { sys_state = 4; state_timer = 0; }
+                    break;
+                    
+                case 4: // 阶段4：吸盘端缓慢放回水平 0° (耗时 3s)
+                    state_timer++;
+                    target_pos[1] = PITCH_90_TARGET - (int32_t)(((float)PITCH_90_TARGET * (float)state_timer) / 3000.0f);
+                    if(state_timer >= 3000) { sys_state = 5; state_timer = 0; target_pos[1] = 0; }
+                    break;
+                // ======================================
+                    
+                case 5: // 阶段5：较快伸出 17 圈 (2s)
+                    state_timer++;
+                    target_pos[2] = (int32_t)(((float)EXTEND_TARGET_OUT * (float)state_timer) / 2000.0f);
+                    if(state_timer >= 2000) { sys_state = 6; state_timer = 0; target_pos[2] = EXTEND_TARGET_OUT; }
+                    break;
+                    
+                case 6: // 阶段6：伸出后稳定 4s
+                    state_timer++;
+                    if(state_timer >= 4000) { sys_state = 7; state_timer = 0; }
+                    break;
+                    
+                case 7: // 阶段7：缩回 20 圈，利用负向目标撞击限位 (-3圈) (2s)
+                    state_timer++;
+                    // 总行程为 20 圈，起点是 17，终点是 -3
+                    target_pos[2] = EXTEND_TARGET_OUT - (int32_t)(((float)(20 * 8192) * (float)state_timer) / 2000.0f);
+                    if(state_timer >= 2000) { sys_state = 8; state_timer = 0; target_pos[2] = EXTEND_TARGET_IN; }
+                    break;
+                    
+                case 8: // 阶段8：舵机转至 225° 3s
+                    state_timer++;
+                    current_servo_angle = 135.0f + (90.0f * (float)state_timer / 3000.0f);
+                    if(state_timer >= 3000) { sys_state = 9; state_timer = 0; current_servo_angle = 225.0f; }
+                    break;
+                    
+                case 9: // 阶段9：舵机在 225° 静止 3s
+                    state_timer++;
+                    if(state_timer >= 3000) { sys_state = 10; state_timer = 0; }
+                    break;
+                    
+                case 10: // 阶段10：舵机回位且机械臂下降 4s
+                    state_timer++;
+                    target_pos[0] = LIFT_TARGET - (int32_t)(((float)LIFT_TARGET * (float)state_timer) / 4000.0f);
+                    current_servo_angle = 225.0f - (90.0f * (float)state_timer / 4000.0f);
+                    if(state_timer >= 4000) { 
+                        sys_state = 11; 
+                        state_timer = 0; 
+                        target_pos[0] = 0;
+                        current_servo_angle = 135.0f;
+                    }
+                    break;
+                    
+                case 11: // 阶段11：循环停顿 2s，方便观察
+                    state_timer++;
+                    
+                    // 【点睛之笔：误差消除】在电机已经死死顶住机械限位时，把它的“记忆”全部清零
+                    // 这样下一轮循环开始时，它又会认为当前位置是完美的 0！
+                    motor[2].total_ecd = 0;
+                    motor[2].total_round = 0;
+                    target_pos[2] = 0;
+
+                    if(state_timer >= 2000) { sys_state = 0; state_timer = 0; }
+                    break;
+            }
+
+            // 更新舵机物理输出
+            Set_Servo_Angle(current_servo_angle);
+
+            // 批量计算 3 个电机的 PID
+            for(int i=0; i<3; i++) {
+                float target_speed = PID_Calc(&pos_pid[i], (float)target_pos[i], (float)motor[i].total_ecd);
+                send_current[i] = (int16_t)PID_Calc(&spd_pid[i], target_speed, (float)motor[i].speed_rpm);
+            }
+
+            // --- CAN 完美封包：三个电机全塞进 0x200 ---
+            CAN_TxHeaderTypeDef tx_header = {0x200, 0, CAN_ID_STD, CAN_RTR_DATA, 8};
+            uint8_t tx_data[8] = {0};
+            uint32_t tx_mailbox;
+            
+            tx_data[0] = send_current[0] >> 8; // ID1 (抬升)
+            tx_data[1] = send_current[0] & 0xFF;
+            tx_data[2] = send_current[1] >> 8; // ID2 (俯仰)
+            tx_data[3] = send_current[1] & 0xFF;
+            tx_data[4] = send_current[2] >> 8; // ID3 (伸缩)
+            tx_data[5] = send_current[2] & 0xFF;
+            
+            HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+        }
+    }
+}
+/* USER CODE END 4 */
+
+void Error_Handler(void)
 {
-  uint32_t tickstart = HAL_GetTick();
-  uint32_t wait = Delay;
-
-  /* Add a freq to guarantee minimum wait */
-  if (wait < HAL_MAX_DELAY)
-  {
-    wait += (uint32_t)(uwTickFreq);
-  }
-
-  while((HAL_GetTick() - tickstart) < wait)
-  {
-  }
+  __disable_irq();
+  while (1) { }
 }
 
-/**
-  * @brief Suspend Tick increment.
-  * @note In the default implementation , SysTick timer is the source of time base. It is
-  *       used to generate interrupts at regular time intervals. Once HAL_SuspendTick()
-  *       is called, the SysTick interrupt will be disabled and so Tick increment 
-  *       is suspended.
-  * @note This function is declared as __weak to be overwritten in case of other
-  *       implementations in user file.
-  * @retval None
-  */
-__weak void HAL_SuspendTick(void)
-{
-  /* Disable SysTick Interrupt */
-  SysTick->CTRL &= ~SysTick_CTRL_TICKINT_Msk;
-}
-
-/**
-  * @brief Resume Tick increment.
-  * @note In the default implementation , SysTick timer is the source of time base. It is
-  *       used to generate interrupts at regular time intervals. Once HAL_ResumeTick()
-  *       is called, the SysTick interrupt will be enabled and so Tick increment 
-  *       is resumed.
-  * @note This function is declared as __weak to be overwritten in case of other
-  *       implementations in user file.
-  * @retval None
-  */
-__weak void HAL_ResumeTick(void)
-{
-  /* Enable SysTick Interrupt */
-  SysTick->CTRL  |= SysTick_CTRL_TICKINT_Msk;
-}
-
-/**
-  * @brief  Returns the HAL revision
-  * @retval version : 0xXYZR (8bits for each decimal, R for RC)
-  */
-uint32_t HAL_GetHalVersion(void)
-{
-  return __STM32F4xx_HAL_VERSION;
-}
-
-/**
-  * @brief  Returns the device revision identifier.
-  * @retval Device revision identifier
-  */
-uint32_t HAL_GetREVID(void)
-{
-  return((DBGMCU->IDCODE) >> 16U);
-}
-
-/**
-  * @brief  Returns the device identifier.
-  * @retval Device identifier
-  */
-uint32_t HAL_GetDEVID(void)
-{
-  return((DBGMCU->IDCODE) & IDCODE_DEVID_MASK);
-}
-
-/**
-  * @brief  Enable the Debug Module during SLEEP mode
-  * @retval None
-  */
-void HAL_DBGMCU_EnableDBGSleepMode(void)
-{
-  SET_BIT(DBGMCU->CR, DBGMCU_CR_DBG_SLEEP);
-}
-
-/**
-  * @brief  Disable the Debug Module during SLEEP mode
-  * @retval None
-  */
-void HAL_DBGMCU_DisableDBGSleepMode(void)
-{
-  CLEAR_BIT(DBGMCU->CR, DBGMCU_CR_DBG_SLEEP);
-}
-
-/**
-  * @brief  Enable the Debug Module during STOP mode
-  * @retval None
-  */
-void HAL_DBGMCU_EnableDBGStopMode(void)
-{
-  SET_BIT(DBGMCU->CR, DBGMCU_CR_DBG_STOP);
-}
-
-/**
-  * @brief  Disable the Debug Module during STOP mode
-  * @retval None
-  */
-void HAL_DBGMCU_DisableDBGStopMode(void)
-{
-  CLEAR_BIT(DBGMCU->CR, DBGMCU_CR_DBG_STOP);
-}
-
-/**
-  * @brief  Enable the Debug Module during STANDBY mode
-  * @retval None
-  */
-void HAL_DBGMCU_EnableDBGStandbyMode(void)
-{
-  SET_BIT(DBGMCU->CR, DBGMCU_CR_DBG_STANDBY);
-}
-
-/**
-  * @brief  Disable the Debug Module during STANDBY mode
-  * @retval None
-  */
-void HAL_DBGMCU_DisableDBGStandbyMode(void)
-{
-  CLEAR_BIT(DBGMCU->CR, DBGMCU_CR_DBG_STANDBY);
-}
-
-/**
-  * @brief  Enables the I/O Compensation Cell.
-  * @note   The I/O compensation cell can be used only when the device supply
-  *         voltage ranges from 2.4 to 3.6 V.  
-  * @retval None
-  */
-void HAL_EnableCompensationCell(void)
-{
-  *(__IO uint32_t *)CMPCR_CMP_PD_BB = (uint32_t)ENABLE;
-}
-
-/**
-  * @brief  Power-down the I/O Compensation Cell.
-  * @note   The I/O compensation cell can be used only when the device supply
-  *         voltage ranges from 2.4 to 3.6 V.  
-  * @retval None
-  */
-void HAL_DisableCompensationCell(void)
-{
-  *(__IO uint32_t *)CMPCR_CMP_PD_BB = (uint32_t)DISABLE;
-}
-
-/**
-  * @brief  Returns first word of the unique device identifier (UID based on 96 bits)
-  * @retval Device identifier
-  */
-uint32_t HAL_GetUIDw0(void)
-{
-  return (READ_REG(*((uint32_t *)UID_BASE)));
-}
-
-/**
-  * @brief  Returns second word of the unique device identifier (UID based on 96 bits)
-  * @retval Device identifier
-  */
-uint32_t HAL_GetUIDw1(void)
-{
-  return (READ_REG(*((uint32_t *)(UID_BASE + 4U))));
-}
-
-/**
-  * @brief  Returns third word of the unique device identifier (UID based on 96 bits)
-  * @retval Device identifier
-  */
-uint32_t HAL_GetUIDw2(void)
-{
-  return (READ_REG(*((uint32_t *)(UID_BASE + 8U))));
-}
-
-#if defined(STM32F427xx) || defined(STM32F437xx) || defined(STM32F429xx)|| defined(STM32F439xx) ||\
-    defined(STM32F469xx) || defined(STM32F479xx)
-/**
-  * @brief  Enables the Internal FLASH Bank Swapping.
-  *   
-  * @note   This function can be used only for STM32F42xxx/43xxx/469xx/479xx devices. 
-  *
-  * @note   Flash Bank2 mapped at 0x08000000 (and aliased @0x00000000) 
-  *         and Flash Bank1 mapped at 0x08100000 (and aliased at 0x00100000)   
-  *
-  * @retval None
-  */
-void HAL_EnableMemorySwappingBank(void)
-{
-  *(__IO uint32_t *)UFB_MODE_BB = (uint32_t)ENABLE;
-}
-
-/**
-  * @brief  Disables the Internal FLASH Bank Swapping.
-  *   
-  * @note   This function can be used only for STM32F42xxx/43xxx/469xx/479xx devices. 
-  *
-  * @note   The default state : Flash Bank1 mapped at 0x08000000 (and aliased @0x00000000) 
-  *         and Flash Bank2 mapped at 0x08100000 (and aliased at 0x00100000) 
-  *           
-  * @retval None
-  */
-void HAL_DisableMemorySwappingBank(void)
-{
-  *(__IO uint32_t *)UFB_MODE_BB = (uint32_t)DISABLE;
-}
-#endif /* STM32F427xx || STM32F437xx || STM32F429xx || STM32F439xx || STM32F469xx || STM32F479xx */
-/**
-  * @}
-  */
-
-/**
-  * @}
-  */
-
-/**
-  * @}
-  */
-
-/**
-  * @}
-  */
-
-
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) { }
+#endif /* USE_FULL_ASSERT */
