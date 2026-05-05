@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32 Debug (ST-Link)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            // 路径已根据你的最新工程位置 D:/STM_Projects/RC2026RoboCon_main 锁定
+            "executable": "${workspaceFolder}/build/Debug/Test01_2026_03_26.elf",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            },
+            // 针对 ST-Link 的优化参数
+            "openocdLaunchCommands": [
+                "init",
+                "reset halt"
+            ]
+        }
+    ]
+}

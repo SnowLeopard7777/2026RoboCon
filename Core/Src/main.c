@@ -2,56 +2,50 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 3轴电机 + 1轴舵机 + 气路吸盘 全自动流程 (纯净修复版)
+  * @brief          : 战队库规范重构版：多轴协同+原生气动 吸取与放置全自动流程
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "bsp_dwt.h"
+#include "daemon.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "math.h"
 #include "stdlib.h"
+#include "string.h"
+
+// 引入战队核心模块库
+#include "DJI_motor.h"
+#include "remote.h"
+#include "relay.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct {
-    int16_t speed_rpm;
-    uint16_t ecd;
-    uint16_t last_ecd;
-    int32_t total_round;
-    int32_t total_ecd;
-} Motor_Measure_t;
 
-typedef struct {
-    float Kp, Ki, Kd;
-    float error, last_error;
-    float integral, max_integral;
-    float output, max_output;
-} PID_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// ----------------- 根据实测修正的最终物理参数 -----------------
-#define LIFT_TARGET_30     (20 * 8192)   // ID1: 第一阶段抬升 20 圈
-#define LIFT_TARGET_40     (60 * 8192)   // ID1: 第二阶段抬升至 60 圈
-#define EXTEND_TARGET_OUT  (13 * 8192)   // ID3: 伸出 13 圈
-#define EXTEND_TARGET_IN   (-10 * 8192)  // ID3: 缩回 -10 圈归零
+// ----------------- 适配大疆库的物理参数 (单位由 Ticks 改为 度 Degree) -----------------
+// DJI_motor 库底层会将编码器换算成角度：1圈 = 360.0f 度
+#define LIFT_TARGET_30     (20.0f * 360.0f)   // ID1: 第一阶段抬升 20 圈
+#define LIFT_TARGET_40     (60.0f * 360.0f)   // ID1: 第二阶段抬升至 60 圈
+#define EXTEND_TARGET_OUT  (13.0f * 360.0f)   // ID3: 伸出 13 圈
+#define EXTEND_TARGET_IN   (-10.0f * 360.0f)  // ID3: 缩回 -10 圈归零
 
 /* 旋转/俯仰 ID2 参数 */
-#define PITCH_90_TARGET    (int32_t)(-53.0f * 8192.0f) // 实测 90° 对应 -53 圈
-#define PITCH_45_TARGET    (int32_t)(-26.5f * 8192.0f) // 45° 对应 -26.5 圈
-
-// ----------------- 气动吸盘原生控制宏 -----------------
-#define RELAY_PORT         GPIOB
-#define RELAY_PIN          GPIO_PIN_12
-#define CATCH_CLAMP()      HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_RESET) // 低电平吸气
-#define CATCH_RELEASE()    HAL_GPIO_WritePin(RELAY_PORT, RELAY_PIN, GPIO_PIN_SET)   // 高电平放气
+#define PITCH_45_TARGET    (-26.5f * 360.0f)  // ID2: 45° 对应 -26.5 圈
 /* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
@@ -62,22 +56,24 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-Motor_Measure_t motor[3];
-PID_t pos_pid[3], spd_pid[3];
 
-int32_t target_pos[3] = {0, 0, 0};
-int16_t send_current[3] = {0, 0, 0};
+// --- 战队库实例指针 ---
+DJIMotor_Instance *motor_lift;     // ID1 抬升
+DJIMotor_Instance *motor_pitch;    // ID2 俯仰
+DJIMotor_Instance *motor_extend;   // ID3 伸缩
+Relay_Instance    *relay_catch;    // 气动继电器
+RC_ctrl_t         *rc_data;        // 遥控器数据
 
-uint8_t is_init[3] = {0, 0, 0};
-int32_t offset_ecd[3] = {0, 0, 0};
+// --- 状态机控制变量 ---
+uint8_t sys_state = 0;               
+uint32_t state_timer = 0;            
 
-uint8_t sys_state = 0;
-uint32_t state_timer = 0;
+// 各轴目标值 (全部变为 float 类型，单位：度)
+float target_pos_lift   = 0.0f;
+float target_pos_pitch  = 0.0f;
+float target_pos_extend = 0.0f;
+float current_servo_angle = 135.0f;  
 
-float current_servo_angle = 135.0f;  // 舵机始终保持在 0° (135.0f)
-
-volatile uint32_t debug_id_1 = 0;
-volatile uint32_t debug_id_2 = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,25 +85,13 @@ static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 
 /* USER CODE BEGIN PFP */
-float PID_Calc(PID_t *pid, float target, float measure);
-void CAN_Filter_Init(CAN_HandleTypeDef *hcan);
 void Set_Servo_Angle(float angle);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-float PID_Calc(PID_t *pid, float target, float measure) {
-    pid->error = target - measure;
-    pid->integral += pid->error;
-    if(pid->integral > pid->max_integral) pid->integral = pid->max_integral;
-    else if(pid->integral < -pid->max_integral) pid->integral = -pid->max_integral;
-    pid->output = pid->Kp * pid->error + pid->Ki * pid->integral + pid->Kd * (pid->error - pid->last_error);
-    pid->last_error = pid->error;
-    if(pid->output > pid->max_output) pid->output = pid->max_output;
-    else if(pid->output < -pid->max_output) pid->output = -pid->max_output;
-    return pid->output;
-}
 
+// 舵机底层映射：输入 0~270，对应脉宽 500~2500。
 void Set_Servo_Angle(float angle) {
     if(angle < 0) angle = 0;
     if(angle > 270.0f) angle = 270.0f;
@@ -115,20 +99,6 @@ void Set_Servo_Angle(float angle) {
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pwm_val);
 }
 
-void CAN_Filter_Init(CAN_HandleTypeDef *hcan) {
-    CAN_FilterTypeDef can_filter;
-    can_filter.FilterBank = 0;
-    can_filter.FilterMode = CAN_FILTERMODE_IDMASK;
-    can_filter.FilterScale = CAN_FILTERSCALE_32BIT;
-    can_filter.FilterIdHigh = 0x0000;
-    can_filter.FilterIdLow = 0x0000;
-    can_filter.FilterMaskIdHigh = 0x0000;
-    can_filter.FilterMaskIdLow = 0x0000;
-    can_filter.FilterFIFOAssignment = CAN_RX_FIFO0;
-    can_filter.FilterActivation = ENABLE;
-    can_filter.SlaveStartFilterBank = 14;
-    HAL_CAN_ConfigFilter(hcan, &can_filter);
-}
 /* USER CODE END 0 */
 
 int main(void)
@@ -143,32 +113,74 @@ int main(void)
   MX_TIM1_Init();
   
   /* USER CODE BEGIN 2 */
-  for(int i=0; i<3; i++) {
-      pos_pid[i].Kp = 0.3f; 
-      pos_pid[i].max_output = 4000; 
-      spd_pid[i].Kp = 5.0f;  
-      spd_pid[i].Ki = 0.1f; 
-      spd_pid[i].max_integral = 5000; 
-      spd_pid[i].max_output = 8000; 
-  }
-  pos_pid[1].Kp = 0.8f; 
+  DWT_Init(168); // F407 主频为 168MHz，提供高精度时间戳给 PID 使用
 
-  CAN_Filter_Init(&hcan1);
-  HAL_CAN_Start(&hcan1);
-  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+  // ==================== 1. 初始化气动继电器 ====================
+  Relay_Init_Config_s relay_conf = {0};
+  relay_conf.gpio1 = GPIOB;
+  relay_conf.gpio_pin1 = GPIO_PIN_12;
+  relay_catch = RelayInit(&relay_conf);
+  RelayOff(relay_catch); // 上电默认放气 (如果你的引脚电平相反，请换成 RelayUp)
+
+  // ==================== 2. 初始化大疆遥控器 ====================
+  rc_data = RemoteControlInit(&huart1);
+
+  // ==================== 3. 规范化注册大疆电机 ====================
+  Motor_Init_Config_s motor_conf;
   
+  // -- 公共配置 --
+  memset(&motor_conf, 0, sizeof(Motor_Init_Config_s));
+  motor_conf.can_init_config.can_handle = &hcan1; 
+  motor_conf.controller_setting_init_config.outer_loop_type = ANGLE_LOOP;
+  motor_conf.controller_setting_init_config.close_loop_type = ANGLE_LOOP | SPEED_LOOP;
+  motor_conf.controller_setting_init_config.motor_reverse_flag = MOTOR_DIRECTION_NORMAL;
+  motor_conf.controller_setting_init_config.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+  motor_conf.controller_setting_init_config.angle_feedback_source = MOTOR_FEED;
+  motor_conf.controller_setting_init_config.speed_feedback_source = MOTOR_FEED;
+
+  // 公共 PID 参数 (位置环+速度环)
+  motor_conf.controller_param_init_config.angle_PID.Kp = 0.3f;
+  motor_conf.controller_param_init_config.angle_PID.MaxOut = 4000;
+  motor_conf.controller_param_init_config.speed_PID.Kp = 5.0f;
+  motor_conf.controller_param_init_config.speed_PID.Ki = 0.1f;
+  motor_conf.controller_param_init_config.speed_PID.MaxOut = 8000;
+  motor_conf.controller_param_init_config.speed_PID.IntegralLimit = 5000;
+
+  // -- 注册 ID1 抬升电机 --
+  motor_conf.motor_type = M3508;
+  motor_conf.can_init_config.rx_id = 0x201;
+  motor_lift = DJIMotorInit(&motor_conf);
+  DJIMotorEnable(motor_lift);
+
+  // -- 注册 ID2 俯仰电机 --
+  motor_conf.can_init_config.rx_id = 0x202;
+  motor_conf.controller_param_init_config.angle_PID.Kp = 0.8f; // 重载电机增加刚性
+  motor_pitch = DJIMotorInit(&motor_conf);
+  DJIMotorEnable(motor_pitch);
+
+  // -- 注册 ID3 伸缩电机 --
+  motor_conf.can_init_config.rx_id = 0x203;
+  motor_conf.controller_param_init_config.angle_PID.Kp = 0.3f; // 恢复 0.3
+  motor_extend = DJIMotorInit(&motor_conf);
+  DJIMotorEnable(motor_extend);
+
+
+  // 启动 CAN 总线
+  HAL_CAN_Start(&hcan1);
+  
+  // 启动舵机与定时器
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
   Set_Servo_Angle(135.0f); // 舵机锁定在 0°
-  
-  CATCH_RELEASE(); // 上电默认放气
 
   HAL_TIM_Base_Start_IT(&htim6);
   /* USER CODE END 2 */
 
   while (1)
   {
+    /* USER CODE BEGIN 3 */
     HAL_Delay(10);
   }
+  /* USER CODE END 3 */
 }
 
 void SystemClock_Config(void)
@@ -273,10 +285,10 @@ static void MX_TIM6_Init(void)
 static void MX_USART1_UART_Init(void)
 {
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 100000; 
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Parity = UART_PARITY_EVEN; 
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
@@ -285,168 +297,138 @@ static void MX_USART1_UART_Init(void)
 
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE(); 
-
-  // 原生气动引脚配置
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); 
-  GPIO_InitStruct.Pin = GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-    CAN_RxHeaderTypeDef rx_header;
-    uint8_t rx_data[8];
-    HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data);
 
-    if (rx_header.StdId >= 0x201 && rx_header.StdId <= 0x203) {
-        uint8_t idx = rx_header.StdId - 0x201; 
-        uint16_t current_ecd = (rx_data[0] << 8) | rx_data[1];
-        if (!is_init[idx]) {
-            offset_ecd[idx] = current_ecd;
-            is_init[idx] = 1;
-            return;
-        }
-        motor[idx].last_ecd = motor[idx].ecd;
-        motor[idx].ecd = current_ecd;
-        motor[idx].speed_rpm = (rx_data[2] << 8) | rx_data[3];
-        int16_t diff = motor[idx].ecd - motor[idx].last_ecd;
-        if (diff < -4096) motor[idx].total_round++;
-        else if (diff > 4096) motor[idx].total_round--;
-        motor[idx].total_ecd = motor[idx].total_round * 8192 + motor[idx].ecd - offset_ecd[idx];
-    }
-}
-
+/* ================= 1ms 定时器：战队库框架下的状态机 ================= */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6) {
-        if(is_init[0] && is_init[1] && is_init[2]) {
-            
-            switch(sys_state) {
-                case 0: // 抬升 20 圈 (3秒)
-                    state_timer++;
-                    target_pos[0] = (int32_t)(((float)LIFT_TARGET_30 * (float)state_timer) / 3000.0f);
-                    target_pos[1] = 0; 
-                    if(state_timer >= 3000) { sys_state = 1; state_timer = 0; target_pos[0] = LIFT_TARGET_30; }
-                    break;
-                    
-                case 1: // 静止 2s
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 2; state_timer = 0; }
-                    break;
 
-                case 2: // 伸出 (2秒)
-                    state_timer++;
-                    target_pos[2] = (int32_t)(((float)EXTEND_TARGET_OUT * (float)state_timer) / 2000.0f);
-                    if(state_timer >= 2000) { sys_state = 3; state_timer = 0; target_pos[2] = EXTEND_TARGET_OUT; }
-                    break;
-                    
-                case 3: // 静止 2s
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 4; state_timer = 0; }
-                    break;
-                    
-                case 4: // 开始吸气
-                    CATCH_CLAMP();
-                    sys_state = 5;
-                    state_timer = 0;
-                    break;
-                    
-                case 5: // 静止 2s (稳固吸附)
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 6; state_timer = 0; }
-                    break;
-                    
-                case 6: // 继续抬升至 60 圈 (耗时 5 秒平滑过渡)
-                    state_timer++;
+        DaemonTask(); // 不断更新各个模块的在线状态
+        // ID2 始终锁定，仅在剧本中被修改
+        target_pos_pitch = 0.0f; 
+
+        switch(sys_state) {
+            case 0: // 抬升 20 圈 (3秒)
+                state_timer++;
+                target_pos_lift = (LIFT_TARGET_30 * (float)state_timer) / 3000.0f;
+                if(state_timer >= 3000) { sys_state = 1; state_timer = 0; target_pos_lift = LIFT_TARGET_30; }
+                break;
+                
+            case 1: // 静止 2s
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 2; state_timer = 0; }
+                break;
+
+            case 2: // 伸出 (2秒)
+                state_timer++;
+                target_pos_extend = (EXTEND_TARGET_OUT * (float)state_timer) / 2000.0f;
+                if(state_timer >= 2000) { sys_state = 3; state_timer = 0; target_pos_extend = EXTEND_TARGET_OUT; }
+                break;
+                
+            case 3: // 静止 2s
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 4; state_timer = 0; }
+                break;
+                
+            case 4: // 开始吸气 (调用战队 Relay 库)
+                RelayUp(relay_catch); // 继电器动作吸合 (如果是低电平有效且接反，请改用 RelayDown)
+                sys_state = 5;
+                state_timer = 0;
+                break;
+                
+            case 5: // 静止 2s (稳固吸附)
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 6; state_timer = 0; }
+                break;
+                
+            case 6: // 继续抬升至 60 圈 (5秒平滑)
+                state_timer++;
+                {
                     float lift_time_ms = 5000.0f;
-                    int32_t remain_dist = LIFT_TARGET_40 - LIFT_TARGET_30;
-                    target_pos[0] = LIFT_TARGET_30 + (int32_t)((float)remain_dist * ((float)state_timer / lift_time_ms));
-                    if(state_timer >= (uint32_t)lift_time_ms) { sys_state = 7; state_timer = 0; target_pos[0] = LIFT_TARGET_40; }
-                    break;
-                    
-                case 7: // 静止 2s
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 8; state_timer = 0; }
-                    break;
-                    
-                case 8: // ID2 电机缓慢向上运动 45° (3秒)
-                    state_timer++;
-                    target_pos[1] = (int32_t)((float)PITCH_45_TARGET * ((float)state_timer / 3000.0f));
-                    if(state_timer >= 3000) { sys_state = 9; state_timer = 0; target_pos[1] = PITCH_45_TARGET; }
-                    break;
-                    
-                case 9: // 静止 2s
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 10; state_timer = 0; }
-                    break;
-                    
-                case 10: // ID2 电机缓慢转回 0° (3秒)
-                    state_timer++;
-                    target_pos[1] = PITCH_45_TARGET - (int32_t)((float)PITCH_45_TARGET * ((float)state_timer / 3000.0f));
-                    if(state_timer >= 3000) { sys_state = 11; state_timer = 0; target_pos[1] = 0; }
-                    break;
-                    
-                case 11: // 静止 2s
-                    state_timer++;
-                    if(state_timer >= 2000) { sys_state = 12; state_timer = 0; }
-                    break;
-
-                case 12: // 放气释放
-                    CATCH_RELEASE();
-                    sys_state = 13;
-                    state_timer = 0;
-                    break;
-
-                case 13: // 下降 & 缩回归零 (4s)
-                    state_timer++;
-                    target_pos[0] = LIFT_TARGET_40 - (int32_t)(((float)LIFT_TARGET_40 * (float)state_timer) / 4000.0f);
-                    target_pos[2] = EXTEND_TARGET_OUT - (int32_t)(((float)(23 * 8192) * (float)state_timer) / 4000.0f);
-                    if(state_timer >= 4000) { 
-                        sys_state = 14; 
-                        state_timer = 0; 
-                        target_pos[0] = 0;
-                        target_pos[2] = EXTEND_TARGET_IN;
+                    float remain_dist = LIFT_TARGET_40 - LIFT_TARGET_30;
+                    target_pos_lift = LIFT_TARGET_30 + (remain_dist * ((float)state_timer / lift_time_ms));
+                    if(state_timer >= (uint32_t)lift_time_ms) { 
+                        sys_state = 7; state_timer = 0; target_pos_lift = LIFT_TARGET_40; 
                     }
-                    break;
+                }
+                break;
+                
+            case 7: // 静止 2s
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 8; state_timer = 0; }
+                break;
+                
+            case 8: // ID2 缓慢向上运动 45° (3秒)
+                state_timer++;
+                target_pos_pitch = PITCH_45_TARGET * ((float)state_timer / 3000.0f);
+                if(state_timer >= 3000) { sys_state = 9; state_timer = 0; target_pos_pitch = PITCH_45_TARGET; }
+                break;
+                
+            case 9: // 静止 2s
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 10; state_timer = 0; }
+                break;
+                
+            case 10: // ID2 缓慢转回 0° (3秒)
+                state_timer++;
+                target_pos_pitch = PITCH_45_TARGET - (PITCH_45_TARGET * ((float)state_timer / 3000.0f));
+                if(state_timer >= 3000) { sys_state = 11; state_timer = 0; target_pos_pitch = 0.0f; }
+                break;
+                
+            case 11: // 静止 2s
+                state_timer++;
+                if(state_timer >= 2000) { sys_state = 12; state_timer = 0; }
+                break;
 
-                case 14: // 结尾停顿 & 清除伸缩误差
-                    state_timer++;
-                    motor[2].total_ecd = 0;
-                    motor[2].total_round = 0;
-                    target_pos[2] = 0;
-                    if(state_timer >= 2000) { sys_state = 0; state_timer = 0; }
-                    break;
-            }
+            case 12: // 放气释放
+                RelayOff(relay_catch); 
+                sys_state = 13;
+                state_timer = 0;
+                break;
 
-            Set_Servo_Angle(current_servo_angle);
+            case 13: // 下降 & 缩回归零 (4s)
+                state_timer++;
+                target_pos_lift = LIFT_TARGET_40 - (LIFT_TARGET_40 * (float)state_timer / 4000.0f);
+                // 总行程为 23 圈 (13 降到 -10)
+                float travel_dist = EXTEND_TARGET_OUT - EXTEND_TARGET_IN;
+                target_pos_extend = EXTEND_TARGET_OUT - (travel_dist * (float)state_timer / 4000.0f);
+                
+                if(state_timer >= 4000) { 
+                    sys_state = 14; 
+                    state_timer = 0; 
+                    target_pos_lift = 0.0f;
+                    target_pos_extend = EXTEND_TARGET_IN;
+                }
+                break;
 
-            for(int i=0; i<3; i++) {
-                float target_speed = PID_Calc(&pos_pid[i], (float)target_pos[i], (float)motor[i].total_ecd);
-                send_current[i] = (int16_t)PID_Calc(&spd_pid[i], target_speed, (float)motor[i].speed_rpm);
-            }
-
-            CAN_TxHeaderTypeDef tx_header = {0x200, 0, CAN_ID_STD, CAN_RTR_DATA, 8};
-            uint8_t tx_data[8] = {0};
-            uint32_t tx_mailbox;
-            tx_data[0] = send_current[0] >> 8; 
-            tx_data[1] = send_current[0] & 0xFF;
-            tx_data[2] = send_current[1] >> 8; 
-            tx_data[3] = send_current[1] & 0xFF;
-            tx_data[4] = send_current[2] >> 8; 
-            tx_data[5] = send_current[2] & 0xFF;
-            HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+            case 14: // 结尾停顿 & 调库清除伸缩误差
+                state_timer++;
+                // 战队库专属：消除电机由于撞击限位带来的内部记忆误差
+                DJIMotorReset(motor_extend);
+                target_pos_extend = 0.0f;
+                
+                if(state_timer >= 2000) { sys_state = 0; state_timer = 0; }
+                break;
         }
+
+        // 1. 设置舵机 (外部手动实现)
+        Set_Servo_Angle(current_servo_angle);
+
+        // 2. 将计算好的期望浮点值下发给大疆库实例
+        DJIMotorSetRef(motor_lift, target_pos_lift);
+        DJIMotorSetRef(motor_pitch, target_pos_pitch);
+        DJIMotorSetRef(motor_extend, target_pos_extend);
+
+        // 3. 一键调用大疆核心处理，内部包含算 PID、组 CAN 封包并发送！
+        DJIMotorControl();
     }
 }
 /* USER CODE END 4 */
@@ -456,8 +438,3 @@ void Error_Handler(void)
   __disable_irq();
   while (1) { }
 }
-
-#ifdef  USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line) { }
-#endif 
-/* USE_FULL_ASSERT */

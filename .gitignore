@@ -1,2 +1,32 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# CMake & Ninja Build artifacts (绝对不能传这个目录！)
 build/
-.vscode/    
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+*.cmake
+Makefile
+*.ninja
+
+# VSCode specific
+.vscode/c_cpp_properties.json
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+*.code-workspace
+
+# OS specific
+.DS_Store
+Thumbs.db
