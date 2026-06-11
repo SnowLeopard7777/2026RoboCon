@@ -1,32 +1,35 @@
-# Prerequisites
-*.d
-
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# CMake & Ninja Build artifacts (绝对不能传这个目录！)
+# Build outputs
 build/
-CMakeCache.txt
+build_new/
+MDK-ARM/VIT6/
 CMakeFiles/
-CMakeScripts/
-*.cmake
-Makefile
+CMakeCache.txt
+cmake_install.cmake
 *.ninja
+*.cmake
 
-# VSCode specific
-.vscode/c_cpp_properties.json
-.vscode/.browse.c_cpp.db*
-.vscode/ipch/
+# Keil generated files
+*.o
+*.d
+*.axf
+*.elf
+*.hex
+*.map
+*.htm
+*.lnp
+*.dep
+*.crf
+*.lst
+*.bak
+*.iex
+*.uvguix.*
+codex_rebuild.log
+*.chm
+
+# VS Code local cache
+.vscode/
 *.code-workspace
 
-# OS specific
+# OS
 .DS_Store
 Thumbs.db

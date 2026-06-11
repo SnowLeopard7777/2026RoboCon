@@ -1,68 +1,111 @@
 cmake_minimum_required(VERSION 3.22)
 
-# Setup compiler settings
+project(RC_NewR1_ElevateR2_M3508_Keil C ASM)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
+set(CMAKE_EXECUTABLE_SUFFIX ".elf")
 
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "Debug")
-endif()
-
-set(CMAKE_PROJECT_NAME Test01_2026_03_26)
-set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
-
-# 确保激活 C 语言与汇编
-project(${CMAKE_PROJECT_NAME} C ASM) 
-message("Build type: " ${CMAKE_BUILD_TYPE})
-
-add_executable(${CMAKE_PROJECT_NAME})
-add_subdirectory(cmake/stm32cubemx)
-
-# ==========================================
-# 🚨 战队核心库配置区 🚨
-# ==========================================
-
-# 1. 搜索所有 .c 源码
-file(GLOB_RECURSE TEAM_LIB_SOURCES 
-    "BSP/*.c" 
-    "MODULE/*.c"
+set(MCU_FLAGS
+    -mcpu=cortex-m7
+    -mfpu=fpv5-d16
+    -mfloat-abi=hard
+    -mthumb
 )
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+add_compile_options(
+    ${MCU_FLAGS}
+    -Wall
+    -ffunction-sections
+    -fdata-sections
+    -fno-common
+    -fmessage-length=0
+)
+
+add_link_options(
+    ${MCU_FLAGS}
+    -T${CMAKE_SOURCE_DIR}/STM32H743VITX_FLASH.ld
+    -Wl,--gc-sections
+    -Wl,-Map=${PROJECT_NAME}.map
+    --specs=nano.specs
+    --specs=nosys.specs
+)
+
+set(FREERTOS_PORT_DIR ${CMAKE_SOURCE_DIR}/Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F)
+
+add_executable(${PROJECT_NAME}
+    startup_stm32h743xx.s
     Core/Src/main.c
-    ${TEAM_LIB_SOURCES}
+    Core/Src/system_stm32h7xx.c
+    Core/Src/stm32h7xx_hal_msp.c
+    Core/Src/stm32h7xx_it.c
+    Core/Src/stm32h7xx_hal_timebase_tim.c
+    Core/Src/fdcan.c
+    Core/Src/usart.c
+    Core/Src/dma.c
+    Core/Src/gpio.c
+    Core/Src/freertos.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_cortex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma_ex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_exti.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_fdcan.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash_ex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_gpio.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_hsem.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_pwr.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_pwr_ex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rcc.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rcc_ex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_tim.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_tim_ex.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c
+    Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart_ex.c
+    Middlewares/Third_Party/FreeRTOS/Source/croutine.c
+    Middlewares/Third_Party/FreeRTOS/Source/event_groups.c
+    Middlewares/Third_Party/FreeRTOS/Source/list.c
+    Middlewares/Third_Party/FreeRTOS/Source/queue.c
+    Middlewares/Third_Party/FreeRTOS/Source/stream_buffer.c
+    Middlewares/Third_Party/FreeRTOS/Source/tasks.c
+    Middlewares/Third_Party/FreeRTOS/Source/timers.c
+    Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2/cmsis_os2.c
+    ${FREERTOS_PORT_DIR}/port.c
+    Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_4.c
+    BSP/bsp_dwt.c
+    BSP/bsp_fdcan.c
+    BSP/bsp_usart.c
+    MOUDLE/algorithm/controller.c
+    MOUDLE/daemon/daemon.c
+    MOUDLE/motor/dji_motor.c
+    MOUDLE/remote/remote.c
+    APP/elevate_control.c
 )
 
-# 2. 添加所有头文件路径
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+target_include_directories(${PROJECT_NAME} PRIVATE
     Core/Inc
-    Drivers/STM32F4xx_HAL_Driver/Inc
+    Drivers/STM32H7xx_HAL_Driver/Inc
+    Drivers/STM32H7xx_HAL_Driver/Inc/Legacy
     Drivers/CMSIS/Include
-    Drivers/CMSIS/Device/ST/STM32F4xx/Include
-    Drivers/CMSIS/DSP/Include   # <== 修复了 arm_math.h 找不到的核心问题
-    BSP/CAN
-    BSP/USART
-    BSP/DWT
-    MODULE
-    MODULE/algorithm
-    MODULE/daemon
-    MODULE/motor
-    MODULE/motor/DJImotor
-    MODULE/relay
-    MODULE/remote
+    Drivers/CMSIS/Device/ST/STM32H7xx/Include
+    Drivers/CMSIS/RTOS2/Include
+    Middlewares/Third_Party/FreeRTOS/Source/include
+    Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+    ${FREERTOS_PORT_DIR}
+    BSP
+    MOUDLE
+    MOUDLE/algorithm
+    MOUDLE/daemon
+    MOUDLE/motor
+    MOUDLE/remote
+    APP
 )
 
-# 3. 宏定义 (已剔除 __FPU_PRESENT 消除黄字警告)
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    ARM_MATH_CM4
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    USE_HAL_DRIVER
+    STM32H743xx
 )
 
-list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
-
-# 4. 链接系统数学库与大疆 DSP 硬件加速库
-target_link_libraries(${CMAKE_PROJECT_NAME}
-    stm32cubemx
-    m
-    ${CMAKE_SOURCE_DIR}/libarm_cortexM4lf_math.a
-)
+target_link_libraries(${PROJECT_NAME} m)
