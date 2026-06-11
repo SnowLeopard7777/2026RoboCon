@@ -52,8 +52,14 @@ __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_rx_error
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_error_logging = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_sync_enabled = 1U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_feedback_ready = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_zero_done = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_protect_active = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_protect_reason = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_protect_latched = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_run_done = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_cycle_count = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_cycle_start_tick_ms = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_cycle_tick_ms = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_motion_tick_ms = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id1_total_ecd = 0;
 __attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id3_total_ecd = 0;
@@ -82,12 +88,17 @@ __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id3_rx_coun
 #define LIFT_ID3_UP_CURRENT                 8100
 #define LIFT_ID3_DOWN_CURRENT               2000
 
-#define LIFT_RAMP_TIME_MS                    400U
+#define LIFT_START_WAIT_MS                  1000U
+#define LIFT_RAMP_TIME_MS                   1500U
+#define LIFT_RUN_ONCE                          1U
 #define LIFT_SYNC_ENABLE                       1U
+#define LIFT_SYNC_START_DELAY_MS            1000U
+#define LIFT_SYNC_DEADBAND_ECD               200
 #define LIFT_SYNC_KP_NUM                       1
-#define LIFT_SYNC_KP_DEN                       8
-#define LIFT_SYNC_MAX_CORRECTION            1800
-#define LIFT_LEVEL_PROTECT_ERROR_ECD        2200
+#define LIFT_SYNC_KP_DEN                    4000
+#define LIFT_SYNC_MAX_CORRECTION             400
+#define LIFT_LEVEL_PROTECT_ERROR_ECD        7000
+#define LIFT_LEVEL_PROTECT_LATCH               1U
 #define LIFT_FEEDBACK_TIMEOUT_MS             100U
 #define LIFT_MOTOR_CURRENT_LIMIT           12000
 /* ====== Lift motion and protection parameters: adjust here ====== */
@@ -104,6 +115,7 @@ __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id3_rx_coun
 #define LIFT_PROTECT_LEVEL_ERROR            1U
 #define LIFT_PROTECT_FEEDBACK_TIMEOUT       2U
 #define LIFT_PROTECT_CAN_NOT_STARTED        3U
+#define LIFT_PROTECT_WAIT_FEEDBACK          4U
 
 typedef struct
 {
@@ -120,6 +132,21 @@ typedef struct
 
 static volatile LiftMotorFeedback_s g_lift_motor1 = {0};
 static volatile LiftMotorFeedback_s g_lift_motor3 = {0};
+
+static void LiftRefreshFeedbackDebug(void);
+
+static void LiftStopOutput(uint32_t protect_active, uint32_t protect_reason)
+{
+  g_lift_protect_active = protect_active;
+  g_lift_protect_reason = protect_reason;
+  g_lift_id1_base_current = 0;
+  g_lift_id3_base_current = 0;
+  g_lift_sync_correction = 0;
+  g_lift_id1_cmd_current = 0;
+  g_lift_id3_cmd_current = 0;
+  g_raw_can_motor1_current = 0;
+  g_raw_can_motor3_current = 0;
+}
 
 static int16_t LiftLimitCurrent(int32_t current)
 {
@@ -149,6 +176,24 @@ static int32_t LiftRampCurrent(int32_t target_current, uint32_t motion_tick_ms)
   if (LIFT_RAMP_TIME_MS == 0U || motion_tick_ms >= LIFT_RAMP_TIME_MS)
     return target_current;
   return (target_current * (int32_t)motion_tick_ms) / (int32_t)LIFT_RAMP_TIME_MS;
+}
+
+static void LiftZeroFeedbackTotals(void)
+{
+  g_lift_motor1.total_ecd = 0;
+  g_lift_motor3.total_ecd = 0;
+  g_lift_zero_done = 1U;
+  g_lift_protect_latched = 0U;
+  LiftRefreshFeedbackDebug();
+}
+
+static void LiftBeginNewCycle(uint32_t start_tick_ms)
+{
+  g_lift_cycle_start_tick_ms = start_tick_ms;
+  g_lift_zero_done = 0U;
+  g_lift_protect_latched = 0U;
+  g_lift_run_done = 0U;
+  LiftStopOutput(0U, LIFT_PROTECT_NONE);
 }
 
 static void LiftUpdateFeedback(volatile LiftMotorFeedback_s *motor, const uint8_t *data, uint32_t tick_ms)
@@ -217,14 +262,33 @@ static void LiftComputeCurrents(uint32_t phase, uint32_t elapsed_ms, uint32_t cu
   int32_t id1_base;
   int32_t id3_base;
   int32_t correction = 0;
+  int32_t sync_error;
   uint8_t feedback_timeout = 0U;
 
+  g_lift_cycle_tick_ms = elapsed_ms;
+  LiftRefreshFeedbackDebug();
+
+  if (phase == 0U) {
+    g_lift_motion_tick_ms = 0U;
+    LiftStopOutput(0U, LIFT_PROTECT_NONE);
+    return;
+  }
+
+  if (elapsed_ms < LIFT_START_WAIT_MS) {
+    LiftStopOutput(1U, LIFT_PROTECT_WAIT_FEEDBACK);
+    return;
+  }
+
+  if (g_lift_feedback_ready != 0U && g_lift_zero_done == 0U) {
+    LiftZeroFeedbackTotals();
+  }
+
   if (phase == 1U) {
-    g_lift_motion_tick_ms = elapsed_ms;
+    g_lift_motion_tick_ms = elapsed_ms - LIFT_START_WAIT_MS;
     id1_base = LiftRampCurrent(LIFT_ID1_UP_CURRENT, g_lift_motion_tick_ms);
     id3_base = LiftRampCurrent(LIFT_ID3_UP_CURRENT, g_lift_motion_tick_ms);
   } else {
-    g_lift_motion_tick_ms = elapsed_ms - LIFT_UP_TIME_MS;
+    g_lift_motion_tick_ms = elapsed_ms - LIFT_START_WAIT_MS - LIFT_UP_TIME_MS;
     id1_base = LiftRampCurrent(LIFT_ID1_DOWN_CURRENT, g_lift_motion_tick_ms);
     id3_base = LiftRampCurrent(LIFT_ID3_DOWN_CURRENT, g_lift_motion_tick_ms);
   }
@@ -238,7 +302,9 @@ static void LiftComputeCurrents(uint32_t phase, uint32_t elapsed_ms, uint32_t cu
     feedback_timeout = 1U;
   }
 
-  if (g_raw_can_started == 0U) {
+  if (g_lift_protect_latched != 0U) {
+    g_lift_protect_active = 1U;
+  } else if (g_raw_can_started == 0U) {
     g_lift_protect_active = 1U;
     g_lift_protect_reason = LIFT_PROTECT_CAN_NOT_STARTED;
   } else if (feedback_timeout != 0U) {
@@ -247,24 +313,25 @@ static void LiftComputeCurrents(uint32_t phase, uint32_t elapsed_ms, uint32_t cu
   } else if (LiftAbs32(g_lift_level_error) > LIFT_LEVEL_PROTECT_ERROR_ECD) {
     g_lift_protect_active = 1U;
     g_lift_protect_reason = LIFT_PROTECT_LEVEL_ERROR;
+    if (LIFT_LEVEL_PROTECT_LATCH != 0U) {
+      g_lift_protect_latched = 1U;
+    }
   } else {
     g_lift_protect_active = 0U;
     g_lift_protect_reason = LIFT_PROTECT_NONE;
   }
 
   if (g_lift_protect_active != 0U) {
-    g_lift_id1_base_current = 0;
-    g_lift_id3_base_current = 0;
-    g_lift_sync_correction = 0;
-    g_lift_id1_cmd_current = 0;
-    g_lift_id3_cmd_current = 0;
-    g_raw_can_motor1_current = 0;
-    g_raw_can_motor3_current = 0;
+    LiftStopOutput(1U, g_lift_protect_reason);
     return;
   }
 
-  if (LIFT_SYNC_ENABLE != 0U) {
-    correction = (g_lift_level_error * LIFT_SYNC_KP_NUM) / LIFT_SYNC_KP_DEN;
+  if (LIFT_SYNC_ENABLE != 0U && g_lift_motion_tick_ms >= LIFT_SYNC_START_DELAY_MS) {
+    sync_error = g_lift_level_error;
+    if (LiftAbs32(sync_error) <= LIFT_SYNC_DEADBAND_ECD) {
+      sync_error = 0;
+    }
+    correction = (sync_error * LIFT_SYNC_KP_NUM) / LIFT_SYNC_KP_DEN;
     correction = LiftLimit32(correction, LIFT_SYNC_MAX_CORRECTION);
   }
 
@@ -394,6 +461,7 @@ int main(void)
 {
   uint32_t last_loop_tick = 0U;
   uint32_t last_send_tick = 0U;
+  uint32_t cycle_start_tick = 0U;
 
   MPU_Config();
 
@@ -411,19 +479,33 @@ int main(void)
   DWT_Init(400);
 
   RawC620_StartCan();
+  cycle_start_tick = HAL_GetTick();
+  LiftBeginNewCycle(cycle_start_tick);
 
   while (1)
   {
     const uint32_t current_tick = HAL_GetTick();
-    const uint32_t cycle_time_ms = RAW_CAN_TEST_UP_TIME_MS + RAW_CAN_TEST_DOWN_TIME_MS;
-    const uint32_t elapsed_ms = current_tick % cycle_time_ms;
+    const uint32_t cycle_time_ms = LIFT_START_WAIT_MS + RAW_CAN_TEST_UP_TIME_MS + RAW_CAN_TEST_DOWN_TIME_MS;
+    uint32_t elapsed_ms = current_tick - cycle_start_tick;
 
     g_main_loop_tick++;
     g_main_hal_tick = current_tick;
     g_main_last_loop_period_ms = current_tick - last_loop_tick;
     last_loop_tick = current_tick;
 
-    if (elapsed_ms < RAW_CAN_TEST_UP_TIME_MS) {
+    if (elapsed_ms >= cycle_time_ms) {
+      if (LIFT_RUN_ONCE != 0U) {
+        elapsed_ms = cycle_time_ms;
+        g_raw_can_phase = 0U;
+        g_lift_run_done = 1U;
+      } else {
+        cycle_start_tick = current_tick;
+        elapsed_ms = 0U;
+        g_lift_cycle_count++;
+        LiftBeginNewCycle(cycle_start_tick);
+        g_raw_can_phase = 1U;
+      }
+    } else if (elapsed_ms < LIFT_START_WAIT_MS + RAW_CAN_TEST_UP_TIME_MS) {
       g_raw_can_phase = 1U;
     } else {
       g_raw_can_phase = 2U;
