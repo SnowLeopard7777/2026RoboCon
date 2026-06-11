@@ -95,6 +95,8 @@ typedef struct
 extern volatile FDCAN_Debug_Bus_s g_fdcan1_debug;
 extern volatile FDCAN_Debug_Bus_s g_fdcan2_debug;
 
+void FDCANRawRxHook(FDCAN_HandleTypeDef *hfdcan, uint32_t rx_id, const uint8_t *data, uint8_t len);
+
 /**
  * @brief 注册(初始化)一个FDCAN实例
  * 

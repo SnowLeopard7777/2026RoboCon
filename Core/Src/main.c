@@ -19,6 +19,7 @@
 /* USER CODE BEGIN Includes */
 #include "bsp_dwt.h"
 #include "bsp_fdcan.h"
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -49,16 +50,233 @@ __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_protocol
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_tx_error_count = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_rx_error_count = 0U;
 __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_raw_can_error_logging = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_sync_enabled = 1U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_feedback_ready = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_protect_active = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_protect_reason = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_motion_tick_ms = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id1_total_ecd = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id3_total_ecd = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id1_lift_pos = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_id3_lift_pos = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_level_error = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int32_t g_lift_sync_correction = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id1_speed_rpm = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id3_speed_rpm = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id1_base_current = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id3_base_current = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id1_cmd_current = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile int16_t g_lift_id3_cmd_current = 0;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id1_rx_tick_ms = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id3_rx_tick_ms = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id1_rx_count = 0U;
+__attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id3_rx_count = 0U;
 
-/* ====== Raw C620 CAN test parameters: adjust here ====== */
-#define RAW_CAN_TEST_UP_TIME_MS             2000U
-#define RAW_CAN_TEST_DOWN_TIME_MS           5000U
-#define RAW_CAN_TEST_ID1_UP_CURRENT        -8100 
-#define RAW_CAN_TEST_ID1_DOWN_CURRENT      -2000
-#define RAW_CAN_TEST_ID3_UP_CURRENT         8100
-#define RAW_CAN_TEST_ID3_DOWN_CURRENT       2000
-#define RAW_CAN_TEST_SEND_PERIOD_MS          10U
-/* ====== Raw C620 CAN test parameters: adjust here ====== */
+/* ====== Lift motion and protection parameters: adjust here ====== */
+#define LIFT_UP_TIME_MS                     2000U
+#define LIFT_DOWN_TIME_MS                   5000U
+#define LIFT_SEND_PERIOD_MS                   10U
+
+#define LIFT_ID1_UP_CURRENT                -8100
+#define LIFT_ID1_DOWN_CURRENT              -2000
+#define LIFT_ID3_UP_CURRENT                 8100
+#define LIFT_ID3_DOWN_CURRENT               2000
+
+#define LIFT_RAMP_TIME_MS                    400U
+#define LIFT_SYNC_ENABLE                       1U
+#define LIFT_SYNC_KP_NUM                       1
+#define LIFT_SYNC_KP_DEN                       8
+#define LIFT_SYNC_MAX_CORRECTION            1800
+#define LIFT_LEVEL_PROTECT_ERROR_ECD        2200
+#define LIFT_FEEDBACK_TIMEOUT_MS             100U
+#define LIFT_MOTOR_CURRENT_LIMIT           12000
+/* ====== Lift motion and protection parameters: adjust here ====== */
+
+#define RAW_CAN_TEST_UP_TIME_MS             LIFT_UP_TIME_MS
+#define RAW_CAN_TEST_DOWN_TIME_MS           LIFT_DOWN_TIME_MS
+#define RAW_CAN_TEST_ID1_UP_CURRENT         LIFT_ID1_UP_CURRENT
+#define RAW_CAN_TEST_ID1_DOWN_CURRENT       LIFT_ID1_DOWN_CURRENT
+#define RAW_CAN_TEST_ID3_UP_CURRENT         LIFT_ID3_UP_CURRENT
+#define RAW_CAN_TEST_ID3_DOWN_CURRENT       LIFT_ID3_DOWN_CURRENT
+#define RAW_CAN_TEST_SEND_PERIOD_MS         LIFT_SEND_PERIOD_MS
+
+#define LIFT_PROTECT_NONE                   0U
+#define LIFT_PROTECT_LEVEL_ERROR            1U
+#define LIFT_PROTECT_FEEDBACK_TIMEOUT       2U
+#define LIFT_PROTECT_CAN_NOT_STARTED        3U
+
+typedef struct
+{
+  uint8_t valid;
+  uint16_t ecd;
+  uint16_t last_ecd;
+  int32_t total_ecd;
+  int16_t speed_rpm;
+  int16_t torque_current;
+  uint8_t temperature;
+  uint32_t rx_tick_ms;
+  uint32_t rx_count;
+} LiftMotorFeedback_s;
+
+static volatile LiftMotorFeedback_s g_lift_motor1 = {0};
+static volatile LiftMotorFeedback_s g_lift_motor3 = {0};
+
+static int16_t LiftLimitCurrent(int32_t current)
+{
+  if (current > LIFT_MOTOR_CURRENT_LIMIT)
+    return LIFT_MOTOR_CURRENT_LIMIT;
+  if (current < -LIFT_MOTOR_CURRENT_LIMIT)
+    return -LIFT_MOTOR_CURRENT_LIMIT;
+  return (int16_t)current;
+}
+
+static int32_t LiftAbs32(int32_t value)
+{
+  return value < 0 ? -value : value;
+}
+
+static int32_t LiftLimit32(int32_t value, int32_t limit)
+{
+  if (value > limit)
+    return limit;
+  if (value < -limit)
+    return -limit;
+  return value;
+}
+
+static int32_t LiftRampCurrent(int32_t target_current, uint32_t motion_tick_ms)
+{
+  if (LIFT_RAMP_TIME_MS == 0U || motion_tick_ms >= LIFT_RAMP_TIME_MS)
+    return target_current;
+  return (target_current * (int32_t)motion_tick_ms) / (int32_t)LIFT_RAMP_TIME_MS;
+}
+
+static void LiftUpdateFeedback(volatile LiftMotorFeedback_s *motor, const uint8_t *data, uint32_t tick_ms)
+{
+  uint16_t ecd;
+  int16_t delta;
+
+  if (motor == NULL || data == NULL)
+    return;
+
+  ecd = ((uint16_t)data[0] << 8) | data[1];
+  if (motor->valid != 0U) {
+    delta = (int16_t)(ecd - motor->last_ecd);
+    if (delta > 4096) {
+      delta -= 8192;
+    } else if (delta < -4096) {
+      delta += 8192;
+    }
+    motor->total_ecd += delta;
+  }
+
+  motor->ecd = ecd;
+  motor->last_ecd = ecd;
+  motor->speed_rpm = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
+  motor->torque_current = (int16_t)(((uint16_t)data[4] << 8) | data[5]);
+  motor->temperature = data[6];
+  motor->rx_tick_ms = tick_ms;
+  motor->rx_count++;
+  motor->valid = 1U;
+}
+
+void FDCANRawRxHook(FDCAN_HandleTypeDef *hfdcan, uint32_t rx_id, const uint8_t *data, uint8_t len)
+{
+  uint32_t tick_ms;
+
+  if (hfdcan != &hfdcan1 || data == NULL || len < 7U)
+    return;
+
+  tick_ms = HAL_GetTick();
+  if (rx_id == 0x201U) {
+    LiftUpdateFeedback(&g_lift_motor1, data, tick_ms);
+  } else if (rx_id == 0x203U) {
+    LiftUpdateFeedback(&g_lift_motor3, data, tick_ms);
+  }
+}
+
+static void LiftRefreshFeedbackDebug(void)
+{
+  g_lift_feedback_ready = (g_lift_motor1.valid != 0U && g_lift_motor3.valid != 0U) ? 1U : 0U;
+  g_lift_id1_total_ecd = g_lift_motor1.total_ecd;
+  g_lift_id3_total_ecd = g_lift_motor3.total_ecd;
+  g_lift_id1_lift_pos = -g_lift_motor1.total_ecd;
+  g_lift_id3_lift_pos = g_lift_motor3.total_ecd;
+  g_lift_level_error = g_lift_id1_lift_pos - g_lift_id3_lift_pos;
+  g_lift_id1_speed_rpm = g_lift_motor1.speed_rpm;
+  g_lift_id3_speed_rpm = g_lift_motor3.speed_rpm;
+  g_lift_id1_rx_tick_ms = g_lift_motor1.rx_tick_ms;
+  g_lift_id3_rx_tick_ms = g_lift_motor3.rx_tick_ms;
+  g_lift_id1_rx_count = g_lift_motor1.rx_count;
+  g_lift_id3_rx_count = g_lift_motor3.rx_count;
+  g_lift_sync_enabled = LIFT_SYNC_ENABLE;
+}
+
+static void LiftComputeCurrents(uint32_t phase, uint32_t elapsed_ms, uint32_t current_tick)
+{
+  int32_t id1_base;
+  int32_t id3_base;
+  int32_t correction = 0;
+  uint8_t feedback_timeout = 0U;
+
+  if (phase == 1U) {
+    g_lift_motion_tick_ms = elapsed_ms;
+    id1_base = LiftRampCurrent(LIFT_ID1_UP_CURRENT, g_lift_motion_tick_ms);
+    id3_base = LiftRampCurrent(LIFT_ID3_UP_CURRENT, g_lift_motion_tick_ms);
+  } else {
+    g_lift_motion_tick_ms = elapsed_ms - LIFT_UP_TIME_MS;
+    id1_base = LiftRampCurrent(LIFT_ID1_DOWN_CURRENT, g_lift_motion_tick_ms);
+    id3_base = LiftRampCurrent(LIFT_ID3_DOWN_CURRENT, g_lift_motion_tick_ms);
+  }
+
+  LiftRefreshFeedbackDebug();
+
+  if (g_lift_feedback_ready == 0U) {
+    feedback_timeout = 1U;
+  } else if ((uint32_t)(current_tick - g_lift_motor1.rx_tick_ms) > LIFT_FEEDBACK_TIMEOUT_MS ||
+             (uint32_t)(current_tick - g_lift_motor3.rx_tick_ms) > LIFT_FEEDBACK_TIMEOUT_MS) {
+    feedback_timeout = 1U;
+  }
+
+  if (g_raw_can_started == 0U) {
+    g_lift_protect_active = 1U;
+    g_lift_protect_reason = LIFT_PROTECT_CAN_NOT_STARTED;
+  } else if (feedback_timeout != 0U) {
+    g_lift_protect_active = 1U;
+    g_lift_protect_reason = LIFT_PROTECT_FEEDBACK_TIMEOUT;
+  } else if (LiftAbs32(g_lift_level_error) > LIFT_LEVEL_PROTECT_ERROR_ECD) {
+    g_lift_protect_active = 1U;
+    g_lift_protect_reason = LIFT_PROTECT_LEVEL_ERROR;
+  } else {
+    g_lift_protect_active = 0U;
+    g_lift_protect_reason = LIFT_PROTECT_NONE;
+  }
+
+  if (g_lift_protect_active != 0U) {
+    g_lift_id1_base_current = 0;
+    g_lift_id3_base_current = 0;
+    g_lift_sync_correction = 0;
+    g_lift_id1_cmd_current = 0;
+    g_lift_id3_cmd_current = 0;
+    g_raw_can_motor1_current = 0;
+    g_raw_can_motor3_current = 0;
+    return;
+  }
+
+  if (LIFT_SYNC_ENABLE != 0U) {
+    correction = (g_lift_level_error * LIFT_SYNC_KP_NUM) / LIFT_SYNC_KP_DEN;
+    correction = LiftLimit32(correction, LIFT_SYNC_MAX_CORRECTION);
+  }
+
+  g_lift_id1_base_current = LiftLimitCurrent(id1_base);
+  g_lift_id3_base_current = LiftLimitCurrent(id3_base);
+  g_lift_sync_correction = correction;
+
+  g_lift_id1_cmd_current = LiftLimitCurrent(id1_base + correction);
+  g_lift_id3_cmd_current = LiftLimitCurrent(id3_base + correction);
+  g_raw_can_motor1_current = g_lift_id1_cmd_current;
+  g_raw_can_motor3_current = g_lift_id3_cmd_current;
+}
 
 static void RawC620_UpdateCanDebug(void)
 {
@@ -207,14 +425,11 @@ int main(void)
 
     if (elapsed_ms < RAW_CAN_TEST_UP_TIME_MS) {
       g_raw_can_phase = 1U;
-      g_raw_can_motor1_current = RAW_CAN_TEST_ID1_UP_CURRENT;
-      g_raw_can_motor3_current = RAW_CAN_TEST_ID3_UP_CURRENT;
     } else {
       g_raw_can_phase = 2U;
-      g_raw_can_motor1_current = RAW_CAN_TEST_ID1_DOWN_CURRENT;
-      g_raw_can_motor3_current = RAW_CAN_TEST_ID3_DOWN_CURRENT;
-
     }
+
+    LiftComputeCurrents(g_raw_can_phase, elapsed_ms, current_tick);
 
     RawC620_UpdateCanDebug();
 

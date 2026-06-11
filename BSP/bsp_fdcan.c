@@ -25,6 +25,14 @@ static FDCAN_Bus_Context_s fdcan_bus_contexts[] = {
 volatile FDCAN_Debug_Bus_s g_fdcan1_debug = {0};
 volatile FDCAN_Debug_Bus_s g_fdcan2_debug = {0};
 
+__weak void FDCANRawRxHook(FDCAN_HandleTypeDef *hfdcan, uint32_t rx_id, const uint8_t *data, uint8_t len)
+{
+    (void)hfdcan;
+    (void)rx_id;
+    (void)data;
+    (void)len;
+}
+
 /* ----------------------------------- 以下为私有函数 ----------------------------------------------- */
 
 /**
@@ -600,6 +608,8 @@ static void FDCANFIFOxCallback(FDCAN_HandleTypeDef *_hfdcan, uint32_t fifox)
                 debug_bus->rx_unmatched_count++;
             }
         }
+
+        FDCANRawRxHook(_hfdcan, rxconf.Identifier, rx_data, data_len);
     }
 }
 
