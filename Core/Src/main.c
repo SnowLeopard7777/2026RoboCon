@@ -89,9 +89,9 @@ __attribute__((section(".ram_d2_nocache"))) volatile uint32_t g_lift_id3_rx_coun
 #define LIFT_ID3_DOWN_CURRENT               2000
 
 #define LIFT_START_WAIT_MS                  1000U
-#define LIFT_RAMP_TIME_MS                   1500U
-#define LIFT_RUN_ONCE                          1U
-#define LIFT_SYNC_ENABLE                       1U
+#define LIFT_RAMP_TIME_MS                    400U
+#define LIFT_RUN_ONCE                          0U
+#define LIFT_SYNC_ENABLE                       0U
 #define LIFT_SYNC_START_DELAY_MS            1000U
 #define LIFT_SYNC_DEADBAND_ECD               200
 #define LIFT_SYNC_KP_NUM                       1
